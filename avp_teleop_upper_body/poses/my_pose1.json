@@ -1,0 +1,26 @@
+{
+  "schema": "avp_upper_body_pose_v1",
+  "note": "",
+  "joints": {
+    "astribot_torso_joint_1": 0.56,
+    "astribot_torso_joint_2": -1.1500000000000004,
+    "astribot_torso_joint_3": 0.65,
+    "astribot_torso_joint_4": 0.0,
+    "astribot_head_joint_1": 0.0,
+    "astribot_head_joint_2": 0.0,
+    "astribot_arm_left_joint_1": -0.49999999999999994,
+    "astribot_arm_left_joint_2": -0.25,
+    "astribot_arm_left_joint_3": -0.9000000000000001,
+    "astribot_arm_left_joint_4": 1.1500000000000004,
+    "astribot_arm_left_joint_5": 0.5499999999999999,
+    "astribot_arm_left_joint_6": -0.25,
+    "astribot_arm_left_joint_7": 0.1,
+    "astribot_arm_right_joint_1": 0.49999999999999994,
+    "astribot_arm_right_joint_2": -0.25,
+    "astribot_arm_right_joint_3": 0.9000000000000001,
+    "astribot_arm_right_joint_4": 1.1500000000000004,
+    "astribot_arm_right_joint_5": -0.5499999999999999,
+    "astribot_arm_right_joint_6": -0.25,
+    "astribot_arm_right_joint_7": -0.1
+  }
+}

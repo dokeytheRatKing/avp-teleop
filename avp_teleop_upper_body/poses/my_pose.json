@@ -1,0 +1,26 @@
+{
+  "schema": "avp_upper_body_pose_v1",
+  "note": "",
+  "joints": {
+    "astribot_torso_joint_1": 0.0,
+    "astribot_torso_joint_2": 0.0,
+    "astribot_torso_joint_3": 0.0,
+    "astribot_torso_joint_4": 0.0,
+    "astribot_head_joint_1": 0.0,
+    "astribot_head_joint_2": 0.0,
+    "astribot_arm_left_joint_1": 0.0,
+    "astribot_arm_left_joint_2": -0.3,
+    "astribot_arm_left_joint_3": 0.0,
+    "astribot_arm_left_joint_4": 0.8,
+    "astribot_arm_left_joint_5": 0.0,
+    "astribot_arm_left_joint_6": 0.0,
+    "astribot_arm_left_joint_7": 0.0,
+    "astribot_arm_right_joint_1": 0.0,
+    "astribot_arm_right_joint_2": -0.3,
+    "astribot_arm_right_joint_3": 0.0,
+    "astribot_arm_right_joint_4": 0.8,
+    "astribot_arm_right_joint_5": 0.0,
+    "astribot_arm_right_joint_6": 0.0,
+    "astribot_arm_right_joint_7": 0.0
+  }
+}

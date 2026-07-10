@@ -7,13 +7,15 @@ Run inside the AVP conda env:
 Covers:
   1. transport: HeadFrame round-trip + mixed head/left/right demux over UDP
   2. pose filter: EMA translation + SLERP rotation (pass-through, half-step, reset)
-  3. teleop MJCF loads; 20 body actuators + both hands' fingers resolve
+  3. teleop MJCF loads; 23 body actuators (3 chassis + torso/neck/arms) + fingers
   4. merged whole-body IK places head + both tools on reachable targets
   5. auto-compensation: a head target moves the torso while the hands hold still
-  6. hard limits: QP velocity/acceleration caps bound the per-tick motion
-  7. soft smoothing: DampingTask + LowAccelerationTask cut peak speed/accel
-  8. finger curl is monotonic from a synthetic "open" to "fist" pose
-  9. end-to-end tick: synthetic head + two hands -> finite ctrl + stable step
+  6. whole-body base: the mobile base is recruited only for out-of-reach targets
+     (priority) and the composite base DOFs map 1:1 to the MuJoCo chassis
+  7. hard limits: QP velocity/acceleration caps bound the per-tick motion
+  8. soft smoothing: DampingTask + LowAccelerationTask cut peak speed/accel
+  9. finger curl is monotonic from a synthetic "open" to "fist" pose
+ 10. end-to-end tick: synthetic head + two hands -> finite ctrl + stable step
 """
 
 from __future__ import annotations
@@ -32,8 +34,10 @@ from avp_teleop.retarget.frames import WristCalibration, wrist_to_tool_target
 from avp_teleop.selfcheck import _synthetic_hand
 
 from avp_teleop_upper_body.config import (
-    default_config, MJCF_PATH, BODY_JOINTS, BODY_HOME, HEAD_FRAME_BODY,
-    TOOL_BODY, all_finger_joints, finger_specs,
+    default_config, MJCF_PATH, BODY_JOINTS, IK_KEEP_JOINTS, BODY_HOME,
+    HEAD_FRAME_BODY, CHASSIS_BASE_FRAME, TORSO_LEAN_JOINTS, TOOL_BODY,
+    CHEST_HEAD_FRAME, CHEST_HIP_FRAME, CHEST_ANKLE_FRAME,
+    all_finger_joints, finger_specs,
 )
 from avp_teleop_upper_body.transport import (
     HeadFrame, HeadFramePublisher, UpperBodySubscriber,
@@ -44,6 +48,17 @@ from avp_teleop_upper_body.pose_filter import PoseFilter
 
 def _ok(name): print(f"  [PASS] {name}")
 def _fail(name, msg): print(f"  [FAIL] {name}: {msg}")
+
+
+# Body-vector layout in BODY_JOINTS order: chassis(3) + torso(4) + neck(2) +
+# left arm(7) + right arm(7) = 23. These slices index the 23-DOF body vector.
+_CHASSIS = slice(0, 3)
+_TORSO = slice(3, 7)
+_LEAN = slice(3, 6)      # torso_joint_1/2/3: the sagittal lean spine
+_WAIST = slice(6, 7)     # torso_joint_4: pure waist yaw
+_NECK = slice(7, 9)
+_LARM = slice(9, 16)
+_RARM = slice(16, 23)
 
 
 def _body_qpos_adr(model):
@@ -153,15 +168,31 @@ def check_model(cfg):
     return model, data
 
 
-def _build_ik(cfg, *, head_ori, arm_ori, damping=None, low_accel=None, enforce=None):
+def _build_ik(cfg, *, head_ori, arm_ori, damping=None, low_accel=None,
+              enforce=None, com_cost=None, trunk_upright_cost=None,
+              chest_over_ankle_cost=None):
     return WholeBodyIK(
-        MJCF_PATH, BODY_JOINTS, HEAD_FRAME_BODY,
+        MJCF_PATH, IK_KEEP_JOINTS, HEAD_FRAME_BODY,
         TOOL_BODY["left"], TOOL_BODY["right"], np.array(BODY_HOME),
+        dof_names=BODY_JOINTS,
         arm_position_cost=cfg.ik.arm_position_cost, arm_orientation_cost=arm_ori,
         head_position_cost=cfg.ik.head_position_cost, head_orientation_cost=head_ori,
         posture_cost=cfg.ik.posture_cost, lm_damping=cfg.ik.lm_damping,
-        damping_cost=cfg.ik.damping_cost if damping is None else damping,
+        damping_cost=cfg.ik.damping_costs() if damping is None else damping,
         low_accel_cost=cfg.ik.low_accel_cost if low_accel is None else low_accel,
+        com_cost=cfg.ik.com_cost if com_cost is None else com_cost,
+        com_cost_vertical=cfg.ik.com_cost_vertical,
+        com_lm_damping=cfg.ik.com_lm_damping,
+        base_frame_name=CHASSIS_BASE_FRAME,
+        trunk_upright_cost=(cfg.ik.trunk_upright_cost if trunk_upright_cost is None
+                            else trunk_upright_cost),
+        trunk_lean_joint_names=TORSO_LEAN_JOINTS,
+        chest_over_ankle_cost=(cfg.ik.chest_over_ankle_cost
+                               if chest_over_ankle_cost is None
+                               else chest_over_ankle_cost),
+        chest_head_frame_name=CHEST_HEAD_FRAME,
+        chest_hip_frame_name=CHEST_HIP_FRAME,
+        chest_ankle_frame_name=CHEST_ANKLE_FRAME,
         max_velocity=cfg.ik.max_velocity(), max_acceleration=cfg.ik.max_acceleration(),
         config_limit_gain=cfg.ik.config_limit_gain, control_dt=cfg.ik.control_dt,
         enforce_limits=cfg.ik.enforce_limits if enforce is None else enforce,
@@ -180,10 +211,18 @@ def check_merged_ik(cfg, model, data) -> bool:
     body_adr = _body_qpos_adr(model)
     home = np.array(BODY_HOME)
     perturb = np.zeros(len(home))
-    perturb[:4] = [0.15, -0.10, 0.10, 0.10]     # torso
-    perturb[4:6] = [0.20, 0.15]                  # neck
-    perturb[6:13] = [0.15, 0.10, -0.10, 0.10, 0.0, 0.0, 0.0]   # left arm
-    perturb[13:20] = [0.15, 0.10, -0.10, 0.10, 0.0, 0.0, 0.0]  # right arm
+    # torso = [lean_1, lean_2, lean_3, waist_yaw]: leave the LEAN spine at 0 and
+    # put the torso motion in the free waist yaw. A non-zero lean here would make
+    # the target trunk-forward / off-balance, which the chest-over-ankle balance
+    # task (see check_balance) deliberately resists -- so it would trade tracking
+    # for balance and (correctly) miss this tight 3 mm bar. Keeping the target
+    # balanced isolates pure merged tracking. The arms carry real joint motion so
+    # the target is still a genuine merged reach.
+    perturb[_TORSO] = [0.0, 0.0, 0.0, 0.15]          # waist yaw only (balanced)
+    perturb[_NECK] = [0.20, 0.15]                    # neck
+    perturb[_LARM] = [0.15, 0.10, -0.10, 0.10, 0.0, 0.0, 0.0]   # left arm
+    perturb[_RARM] = [0.15, 0.10, -0.10, 0.10, 0.0, 0.0, 0.0]   # right arm
+    # chassis (_CHASSIS) left at 0: this target is reachable without the base.
     q_true = np.clip(home + perturb, ik.lower, ik.upper)
 
     names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
@@ -213,21 +252,29 @@ def check_auto_compensation(cfg, model, data) -> bool:
     the torso to place the head, and re-solve the arms so the hands still track.
 
     The three targets come from one real perturbed config (so they ARE jointly
-    reachable). The torso is bent a lot and the arm joints barely move, so the
-    hand tool targets shift almost entirely because their BASES move with the
-    torso -- tracking them therefore proves the arms compensate for torso motion.
+    reachable). The WAIST YAW (torso_joint_4) is turned a lot and the arm joints
+    barely move, so the hand tool targets shift almost entirely because their
+    BASES swing with the waist -- tracking them therefore proves the arms
+    compensate for torso motion. We drive the waist YAW (not the lean spine): yaw
+    is a freely-moving DOF, whereas the lean spine is now deliberately damped to
+    the lowest priority (see check_balance), so demanding a big lean here would
+    (correctly) be resisted and would not test arm compensation cleanly.
     """
     ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0)
     body_adr = _body_qpos_adr(model)
     home = np.array(BODY_HOME)
 
-    # Big torso bend + small neck; arms left at home (so hand motion is purely
-    # the torso dragging the arm bases). Jointly reachable by construction.
+    # Big waist YAW (torso_joint_4) + small neck; LEAN spine left at 0 and arms
+    # left at home (so hand motion is purely the torso swinging the arm bases).
+    # Jointly reachable by construction. torso = [lean_1, lean_2, lean_3, yaw].
+    # Lean is kept at 0 so the target stays balanced (a leaned target would be
+    # resisted by the chest-over-ankle balance task, see check_balance, muddying
+    # the arm-compensation signal).
     q_true = home.copy()
-    q_true[:4] = np.clip(home[:4] + np.array([0.30, -0.20, 0.20, 0.20]),
-                         ik.lower[:4], ik.upper[:4])
-    q_true[4:6] = np.clip(home[4:6] + np.array([0.10, 0.10]),
-                          ik.lower[4:6], ik.upper[4:6])
+    q_true[_TORSO] = np.clip(home[_TORSO] + np.array([0.0, 0.0, 0.0, 0.60]),
+                             ik.lower[_TORSO], ik.upper[_TORSO])
+    q_true[_NECK] = np.clip(home[_NECK] + np.array([0.10, 0.10]),
+                            ik.lower[_NECK], ik.upper[_NECK])
 
     names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
     tgt = _fk_frames(model, data, body_adr, q_true, names)
@@ -239,7 +286,7 @@ def check_auto_compensation(cfg, model, data) -> bool:
     for _ in range(120):
         q = ik.solve(q, head_t, left_t, right_t)
 
-    torso_moved = float(np.abs(q[:4] - home[:4]).max())
+    torso_moved = float(np.abs(q[_TORSO] - home[_TORSO]).max())
     sol = _fk_frames(model, data, body_adr, q, names)
     errs = {n: float(np.linalg.norm(sol[n][1] - tgt[n][1])) for n in names}
     worst = max(errs.values())
@@ -253,6 +300,189 @@ def check_auto_compensation(cfg, model, data) -> bool:
     _fail("auto-compensation",
           f"torso moved {torso_moved:.3f} rad, max frame err {worst*1000:.1f} mm")
     return False
+
+
+def check_whole_body(cfg, model, data) -> bool:
+    """The mobile base is a full IK DOF: recruited only for out-of-reach targets
+    (whole-body priority), and its composite DOFs map 1:1 to the MuJoCo chassis.
+
+    (a) the reduced model exposes all 23 body DOFs (chassis included);
+    (b) DOF round-trip: the SAME body vector run through the IK's own FK (which
+        expands the composite base joint) and through MuJoCo's FK (which sets the
+        3 chassis qpos directly) agree -> the composite x/y/yaw order lines up
+        with BODY_JOINTS, so the 23-vector the solver returns drives the right
+        chassis actuators;
+    (c) priority: a NEAR target (reachable by the arms/torso) barely moves the
+        base, while a FAR target (a large world translation the upper body can't
+        cover) clearly translates the base -- and tracks it -- proving the base
+        is a last-resort DOF, not an eager one.
+    """
+    ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0)
+    body_adr = _body_qpos_adr(model)
+    home = np.array(BODY_HOME)
+    names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
+
+    # (a) all 23 DOFs present, chassis included.
+    if ik.n != len(BODY_JOINTS):
+        _fail("whole body", f"IK exposes {ik.n} DOFs, expected {len(BODY_JOINTS)}")
+        return False
+
+    # (b) composite base DOF-order round-trip: a config with the base moved.
+    q_probe = home.copy()
+    q_probe[_CHASSIS] = [0.30, -0.20, 0.40]              # x, y, yaw
+    q_probe[_LARM] = home[_LARM] + np.array([0.10, 0.10, 0.0, 0.10, 0.0, 0.0, 0.0])
+    mj = _fk_frames(model, data, body_adr, q_probe, names)
+    rt_err = 0.0
+    for nm in names:
+        _, p_ik = ik.frame_pose(q_probe, nm)             # Pinocchio FK (composite)
+        rt_err = max(rt_err, float(np.linalg.norm(p_ik - mj[nm][1])))
+    if rt_err > 1e-3:
+        _fail("whole body", f"base DOF round-trip mismatch {rt_err*1000:.2f} mm "
+              f"(composite x/y/yaw order != BODY_JOINTS?)")
+        return False
+
+    # (c) priority: apply a common world translation to ALL three targets. A
+    # small shift is coverable by the arms/torso (base should stay put); a large
+    # shift is not (base must translate). Position-only targets (R=None).
+    base0 = _fk_frames(model, data, body_adr, home, names)   # poses at home
+
+    def _solve_shift(d, iters=200):
+        targets = {nm: (base0[nm][1] + d, None) for nm in names}
+        ik.reset()
+        q = home.copy()
+        for _ in range(iters):
+            q = ik.solve(q, targets[names[0]], targets[names[1]], targets[names[2]])
+        sol = _fk_frames(model, data, body_adr, q, names)
+        err = max(float(np.linalg.norm(sol[nm][1] - targets[nm][0])) for nm in names)
+        base_disp = float(np.linalg.norm(q[_CHASSIS][:2] - home[_CHASSIS][:2]))  # x/y (m)
+        return q, err, base_disp
+
+    _, _, base_near = _solve_shift(np.array([0.05, 0.0, 0.0]), iters=200)   # within reach
+    # A rigid 0.5 m shift is well beyond the arms' reach, so the base must carry
+    # it; give it iterations to trundle over (the base is deliberately damped, so
+    # it converges slowly -- in live teleop the target moves gradually and this
+    # lag is small).
+    _, err_far, base_far = _solve_shift(np.array([0.50, 0.0, 0.0]), iters=400)  # beyond reach
+
+    if base_near > 0.05:
+        _fail("whole body", f"base moved {base_near*100:.1f} cm for an in-reach "
+              f"target (should stay ~put; chassis damping too low?)")
+        return False
+    if not (base_far > 0.20 and base_far > 5.0 * max(base_near, 1e-3)):
+        _fail("whole body", f"base not recruited for a far target "
+              f"(moved {base_far*100:.1f} cm; near {base_near*100:.1f} cm)")
+        return False
+    if err_far > 1.5e-2:
+        _fail("whole body", f"far target not tracked with the base "
+              f"({err_far*1000:.1f} mm residual)")
+        return False
+
+    _ok(f"whole-body base (round-trip {rt_err*1000:.2f} mm; base "
+        f"{base_near*100:.1f}cm near vs {base_far*100:.1f}cm far, "
+        f"far tracks {err_far*1000:.1f}mm)")
+    return True
+
+
+def check_balance(cfg, model, data) -> bool:
+    """The chest stays over the ankle (primary) + the trunk stays ~upright.
+
+    Balance is enforced primarily by the chest-over-ankle task: the upper-body
+    CoM (approximated by the head-joint / hip-joint midpoint) must stay over the
+    ankle joint (torso_joint_1) in the ground plane. The trunk-upright task (sum
+    of lean angles -> 0) is a soft secondary regulariser. This check asserts the
+    behaviours the design must trade off:
+
+    (a) a GRATUITOUS reach (hands forward / forward-down, head fixed) keeps the
+        chest over the ankle (small horizontal offset) -- no tip-forward;
+    (b) a GENUINE height change (head AND hands descending together -- a squat)
+        still succeeds and tracks well, with the chest STILL over the ankle,
+        because the two free spine DOFs fold like an accordion. If the lean spine
+        were frozen the squat would fail to track; if balance were missing the
+        chest offset would blow up (the tip-forward bug: the cited failure pose
+        put the chest ~66 cm ahead of the ankle);
+    (c) NO-INPUT STABILITY: with fixed targets and no operator motion, the base
+        must NOT creep -- the failure mode of the mass-based ComTask (regression
+        guard for the base-drift bug).
+    """
+    body_adr = _body_qpos_adr(model)
+    home = np.array(BODY_HOME)
+    names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
+
+    if (cfg.ik.chest_over_ankle_cost <= 0 and cfg.ik.trunk_upright_cost <= 0
+            and cfg.ik.com_cost <= 0):
+        _ok("balance (no balance task configured: skipped)")
+        return True
+
+    ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0)
+    base0 = _fk_frames(model, data, body_adr, home, names)
+
+    def _joint_xy(q, joint_name):
+        """World (x, y) of a joint anchor with body joints at q (rest 0)."""
+        data.qpos[:] = 0.0
+        for adr, qi in zip(body_adr, q):
+            data.qpos[adr] = qi
+        mujoco.mj_forward(model, data)
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        return data.xanchor[jid][:2].copy()
+
+    def _chest_offset(q):
+        """Horizontal distance from the chest (head/hip midpoint) to the ankle."""
+        chest = 0.5 * (_joint_xy(q, CHEST_HEAD_FRAME) + _joint_xy(q, CHEST_HIP_FRAME))
+        return float(np.linalg.norm(chest - _joint_xy(q, CHEST_ANKLE_FRAME)))
+
+    def _drive(d_hands, d_head, iters=500):
+        ik.reset()
+        q = home.copy()
+        tgt = {names[0]: (base0[names[0]][1] + d_head, base0[names[0]][0])}
+        for nm in names[1:]:
+            tgt[nm] = (base0[nm][1] + d_hands, base0[nm][0])
+        for _ in range(iters):
+            q = ik.solve(q, tgt[names[0]], tgt[names[1]], tgt[names[2]])
+        sol = _fk_frames(model, data, body_adr, q, names)
+        err = max(float(np.linalg.norm(sol[nm][1] - tgt[nm][0])) for nm in names)
+        return q, _chest_offset(q), err
+
+    # (a) gratuitous forward-down reach: chest should stay over the ankle.
+    _, chest_reach, _ = _drive(np.array([0.20, 0.0, -0.10]),
+                               np.array([0.0, 0.0, 0.0]))
+    # (b) coordinated squat: head + hands descend together -> real height change.
+    q_sq, chest_squat, err_squat = _drive(np.array([0.0, 0.0, -0.20]),
+                                          np.array([0.0, 0.0, -0.18]))
+    squat_fold = float(np.abs(q_sq[_LEAN] - home[_LEAN]).max())   # individual fold
+
+    # (c) no-input stability: fixed home targets, many ticks -> no base creep.
+    q0, chest_idle, _ = _drive(np.zeros(3), np.zeros(3), iters=1500)
+    base_creep = float(np.linalg.norm(q0[_CHASSIS][:2] - home[_CHASSIS][:2]))
+
+    if chest_reach > 0.08:
+        _fail("balance", f"chest drifted {chest_reach*100:.1f} cm ahead of the "
+              f"ankle on a plain reach (tip-forward; chest_over_ankle_cost low?)")
+        return False
+    if err_squat > 5e-3:
+        _fail("balance", f"squat failed to track ({err_squat*1000:.1f} mm; lean "
+              f"spine frozen? damping_cost_lean too high?)")
+        return False
+    if chest_squat > 0.08:
+        _fail("balance", f"chest drifted {chest_squat*100:.1f} cm off the ankle "
+              f"during the squat (should fold over the ankle)")
+        return False
+    if squat_fold < 0.15:
+        _fail("balance", f"squat barely folded the spine ({squat_fold:.2f} rad "
+              f"max joint move; can't change height?)")
+        return False
+    if base_creep > 0.02:
+        _fail("balance", f"base crept {base_creep*100:.1f} cm with no input "
+              f"(ComTask-style drift regression; com_cost re-enabled?)")
+        return False
+    if chest_idle > 0.05:
+        _fail("balance", f"chest drifted {chest_idle*100:.1f} cm off the ankle "
+              f"with no input (idle instability regression)")
+        return False
+
+    _ok(f"balance: reach keeps chest {chest_reach*100:.1f} cm off ankle; squat "
+        f"tracks {err_squat*1000:.1f} mm folding {squat_fold:.2f} rad at "
+        f"{chest_squat*100:.1f} cm; no-input creep {base_creep*100:.1f} cm")
+    return True
 
 
 def check_limits(cfg, model, data) -> bool:
@@ -269,10 +499,10 @@ def check_limits(cfg, model, data) -> bool:
     home = np.array(BODY_HOME)
 
     perturb = np.zeros(len(home))
-    perturb[:4] = [0.25, -0.20, 0.20, 0.20]                  # torso
-    perturb[4:6] = [0.20, 0.15]                              # neck
-    perturb[6:13] = [0.30, 0.20, -0.20, 0.25, 0.0, 0.0, 0.0]   # left arm
-    perturb[13:20] = [0.30, 0.20, -0.20, 0.25, 0.0, 0.0, 0.0]  # right arm
+    perturb[_TORSO] = [0.25, -0.20, 0.20, 0.20]                  # torso
+    perturb[_NECK] = [0.20, 0.15]                                # neck
+    perturb[_LARM] = [0.30, 0.20, -0.20, 0.25, 0.0, 0.0, 0.0]    # left arm
+    perturb[_RARM] = [0.30, 0.20, -0.20, 0.25, 0.0, 0.0, 0.0]    # right arm
     q_true = np.clip(home + perturb, ik.lower, ik.upper)
 
     names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
@@ -352,10 +582,13 @@ def check_smoothing(cfg, model, data) -> bool:
     names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
 
     perturb = np.zeros(len(home))
-    perturb[:4] = [0.25, -0.20, 0.20, 0.20]                     # torso
-    perturb[4:6] = [0.20, 0.15]                                 # neck
-    perturb[6:13] = [0.30, 0.20, -0.20, 0.25, 0.0, 0.0, 0.0]    # left arm
-    perturb[13:20] = [0.30, 0.20, -0.20, 0.25, 0.0, 0.0, 0.0]   # right arm
+    # Small lean (lowest-priority damped tier) + waist yaw; the real slew is in
+    # the arms. Keeps the target reachable at the gentle default costs so part
+    # (a) can assert tracking (a big lean would be resisted by design).
+    perturb[_TORSO] = [0.05, -0.05, 0.05, 0.20]                     # small lean + yaw
+    perturb[_NECK] = [0.20, 0.15]                                   # neck
+    perturb[_LARM] = [0.30, 0.20, -0.20, 0.25, 0.0, 0.0, 0.0]       # left arm
+    perturb[_RARM] = [0.30, 0.20, -0.20, 0.25, 0.0, 0.0, 0.0]       # right arm
 
     def _run(ik, n=160):
         q_true = np.clip(home + perturb, ik.lower, ik.upper)
@@ -497,6 +730,8 @@ def main() -> int:
 
     results.append(check_merged_ik(cfg, model, data))
     results.append(check_auto_compensation(cfg, model, data))
+    results.append(check_whole_body(cfg, model, data))
+    results.append(check_balance(cfg, model, data))
     results.append(check_limits(cfg, model, data))
     results.append(check_smoothing(cfg, model, data))
     results.append(check_fingers(cfg))

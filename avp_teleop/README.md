@@ -117,6 +117,52 @@ python -m avp_teleop.sim_teleop --side both
 
 按 `c` 一次即同时标定左右臂，之后两只手各自独立跟随。位置调通后可加 `--orientation`。
 
+---
+
+## 录制轨迹 & 离线回放（真机验证前的保险步骤）
+
+目标：先用 AVP 录一段重定向后的**关节空间动作序列**，存成 Astribot 真机能吃的格式；再在 MuJoCo 里一帧一帧回放这段序列（不接 AVP、不走网络），确认机器人能复现。同一份文件将来即可通过 ROS2 推给真机 S1。
+
+### 1) 录制（在 `sim_teleop` 里顺带录）
+
+```bash
+# 终端 A：照常发布 AVP 手部帧
+python -m avp_teleop.avp_publisher --avp-ip 10.200.177.142 --side both
+# 终端 B：照常遥操，额外加 --record 指定输出文件
+python -m avp_teleop.sim_teleop --side both --record my_clip.json
+```
+
+- 先按 `c` 标定，动作调顺后按 **`r`** 开始录制，再按 `r` 停止（可反复分段）。想一进去就录加 `--record-autostart`。
+- 只在「已标定 + 未暂停 + 已 armed」时才记帧，所以起始摆位/settle 不会被录进去。
+- 状态行会显示 `REC 123f`（正在录）或 `rec paused (123f)`。关闭窗口时自动写盘。
+
+### 2) 离线回放（用录好的文件驱动 MuJoCo，不需要 AVP）
+
+```bash
+# 默认回放进遥操模型（灵巧手），实时速度
+python -m avp_teleop.replay_sim my_clip.json
+# 半速看细节 / 循环 / 无头验证
+python -m avp_teleop.replay_sim my_clip.json --speed 0.5 --loop
+python -m avp_teleop.replay_sim my_clip.json --no-render
+```
+
+回放器按**关节名**把每帧命令映射到当前模型里对应的执行器，因此与模型无关：遥操模型下 15 个手指关节生效、派生的夹爪值被跳过；换夹爪模型（`--mjcf .../astribot_s1_with_gripper.xml`）则相反。文件里模型没有的关节会被安全跳过并提示一次。
+
+### 3) 推到真机（ROS2，尚未在硬件上验证）
+
+```bash
+# 在装了 ROS2 + astribot_msgs 的机器上（例如 ssh 到机器人）：
+python3 -m avp_teleop.replay_ros2 my_clip.json --dry-run     # 先只打印不发布
+python3 -m avp_teleop.replay_ros2 my_clip.json               # 发布双臂 + 夹爪
+python3 -m avp_teleop.replay_ros2 my_clip.json --include-torso-head
+```
+
+按录制时序，把每个部件的命令以 `RobotJointController`（`mode=1` 位置）发到 `/<component>/joint_space_command`。**注意**：`rclpy`/`astribot_msgs` 不在 `AVP` conda 环境里，此脚本要在机器人/ROS2 主机上跑；夹爪值是从手指闭合度派生映射到 `[0,100]` 的，**符号/量程未在真机核对过**，务必先 `--dry-run`、留好急停、并让机器人先靠近首帧姿态。
+
+### 录制文件格式
+
+JSON，`schema="astribot_joint_trajectory"`, `version=1`：`metadata` 里有 `nominal_dt`、`sides`、`control_mode`、各部件的有序关节名；`frames` 是 `{t, commands:{部件->数值}}` 列表。每帧都是一条**完整的 S1 关节空间命令**（双臂 7×2 + 夹爪 ×2 + 躯干 4 + 头 2），外加 `hand_left`/`hand_right` 各 15 个 BrainCo 手指关节（供灵巧手模型忠实回放）。详见 [recording.py](recording.py)。
+
 **设计要点（为什么这样做）**：
 
 - **两个独立的单臂求解器，而不是一个 14-DOF 合并求解器。** 现有 Pink IK 在求解时把躯干/头/底盘/另一只手都**锁在中立位**，所以左右臂在运动学上**相互独立**——分开解就是精确解，没有被忽略的耦合。这也最贴合将来上真机时左右臂各自一个 ROS 命名空间的结构。
@@ -154,7 +200,10 @@ avp_teleop/
     arm_ik_pink.py     # [默认] Pinocchio + Pink 差分 IK（同 solve 接口，精准/自然/抗奇异）
     hand_retarget.py   # 21 关键点 → 每指弯曲度[0,1] → 手指关节目标
   robot_interface.py   # 机器人抽象层：SimRobot(MuJoCo) / ROSRobot(留桩)
-  sim_teleop.py        # 主循环：订阅 → 映射 → 写 ctrl → 步进 + 渲染（按 side 维护 1~2 个控制器，支持双臂）
+  sim_teleop.py        # 主循环：订阅 → 映射 → 写 ctrl → 步进 + 渲染（支持双臂；--record 顺带录轨迹）
+  recording.py         # 轨迹录制：关节空间命令 → Astribot ROS2 格式 JSON（含派生夹爪值）
+  replay_sim.py        # 离线回放：录好的 JSON → 驱动 MuJoCo 模型逐帧复现（不接 AVP）
+  replay_ros2.py       # 真机回放：JSON → 逐帧发 RobotJointController 到 ROS2（未在硬件验证）
   selfcheck.py         # 离线自检（无需硬件）
 
 astribot_simulation/astribot_descriptions/mjcf/astribot_s1_mjcf/
@@ -247,5 +296,7 @@ Pink 的 Pinocchio 模型**直接从仿真用的同一个 MJCF 构建**，而不
 ## 将来怎么接真机 / ROS
 
 `robot_interface.py` 里已经把机器人抽象成 `RobotInterface`。现在用的是 `SimRobot`（MuJoCo），将来上真机只需实现 `ROSRobot`（已留桩），把 `command_arm` / `command_fingers` 接到 Astribot 的 ROS 关节话题上（参考 `astribot_simulation` 里的 `robot_ros_interface.py`，发布 `RobotJointController` 到 `/<robot>/joint_space_command`）。主循环和映射逻辑完全不用改。
+
+**已经落地的真机对接第一步**：`recording.py` + `replay_ros2.py` 已经按上面这套 ROS2 关节空间格式实现了「录制→回放」。推荐的真机验证路径是**先录后放**（比实时遥操上真机安全）：用 `sim_teleop --record` 录一段，`replay_sim` 在仿真里确认没问题，再用 `replay_ros2`（在 ROS2 主机上）逐帧推给真机。见上面「录制轨迹 & 离线回放」一节。
 
 同理，`transport.py` 的 UDP 收发这一层也可以整体替换成 ROS 的 pub/sub —— 发布端和订阅端只约定了 `HandFrame` 这一个数据结构。

@@ -5,9 +5,10 @@ Pipeline (this process):
     UDP {head, left, right}  ->  merged whole-body IK + finger retarget
                              ->  data.ctrl  ->  mj_step  ->  viewer
 
-A single :class:`WholeBodyIK` solves the 20-DOF upper body (torso + neck + both
-arms) so the robot head camera tracks the AVP head pose while the two tool
-frames track the hands. The arms automatically compensate for torso motion
+A single :class:`WholeBodyIK` solves the 23-DOF whole body (mobile base + torso
++ neck + both arms) so the robot head camera tracks the AVP head pose while the
+two tool frames track the hands. The arms automatically compensate for torso
+motion, and the base translates/yaws to extend reach for out-of-reach targets,
 because all three end-effector tasks share one configuration.
 
 Run inside the ``AVP`` conda env (after starting the publisher in another shell):
@@ -39,8 +40,14 @@ from avp_teleop_upper_body.config import (
     default_config,
     MJCF_PATH,
     BODY_JOINTS,
+    IK_KEEP_JOINTS,
     BODY_HOME,
     HEAD_FRAME_BODY,
+    CHASSIS_BASE_FRAME,
+    TORSO_LEAN_JOINTS,
+    CHEST_HEAD_FRAME,
+    CHEST_HIP_FRAME,
+    CHEST_ANKLE_FRAME,
     TOOL_BODY,
     all_finger_joints,
     finger_specs,
@@ -67,7 +74,7 @@ def _T(R: np.ndarray, p: np.ndarray) -> np.ndarray:
 
 
 def _set_body_home(model, data, robot: SimRobot, home) -> None:
-    """Place the 20 body joints at home and hold them via the actuators."""
+    """Place the body joints at home and hold them via the actuators."""
     for adr, qi in zip(robot._arm_qpos_adr, home):
         data.qpos[adr] = qi
     mujoco.mj_forward(model, data)
@@ -134,7 +141,8 @@ def main() -> None:
         body_home = np.array(BODY_HOME, dtype=np.float64)
         print("[SIM] Initial pose: BODY_HOME (default)")
 
-    # One robot owns the 20 body joints + all finger joints; its "tool" is the
+    # One robot owns the 23 body joints (chassis + torso + neck + arms) + all
+    # finger joints; its "tool" is the
     # head camera (used for head calibration). Tool-link poses are read directly.
     body_robot = SimRobot(model, data, BODY_JOINTS, all_finger_joints(),
                           HEAD_FRAME_BODY)
@@ -149,7 +157,8 @@ def main() -> None:
     head_ori = cfg.ik.head_orientation_cost if cfg.head_track_orientation else 0.0
     ik = WholeBodyIK(
         mjcf_path,
-        body_joint_names=BODY_JOINTS,
+        body_joint_names=IK_KEEP_JOINTS,   # reduced-model names (base = composite)
+        dof_names=BODY_JOINTS,             # per-DOF command order (base = x/y/yaw)
         head_frame_name=HEAD_FRAME_BODY,
         left_tool_name=TOOL_BODY["left"],
         right_tool_name=TOOL_BODY["right"],
@@ -160,8 +169,18 @@ def main() -> None:
         head_orientation_cost=head_ori,
         posture_cost=cfg.ik.posture_cost,
         lm_damping=cfg.ik.lm_damping,
-        damping_cost=cfg.ik.damping_cost,
+        damping_cost=cfg.ik.damping_costs(),   # per-DOF: lean high, base mid, upper low
         low_accel_cost=cfg.ik.low_accel_cost,
+        com_cost=cfg.ik.com_cost,
+        com_cost_vertical=cfg.ik.com_cost_vertical,
+        com_lm_damping=cfg.ik.com_lm_damping,
+        base_frame_name=CHASSIS_BASE_FRAME,
+        trunk_upright_cost=cfg.ik.trunk_upright_cost,
+        trunk_lean_joint_names=TORSO_LEAN_JOINTS,
+        chest_over_ankle_cost=cfg.ik.chest_over_ankle_cost,
+        chest_head_frame_name=CHEST_HEAD_FRAME,
+        chest_hip_frame_name=CHEST_HIP_FRAME,
+        chest_ankle_frame_name=CHEST_ANKLE_FRAME,
         max_velocity=cfg.ik.max_velocity(),
         max_acceleration=cfg.ik.max_acceleration(),
         config_limit_gain=cfg.ik.config_limit_gain,
@@ -207,10 +226,10 @@ def main() -> None:
           f"alpha_R={cfg.filter.alpha_rotation:.2f} "
           f"(1.0=off; smaller=smoother)")
     if cfg.ik.enforce_limits:
-        print(f"[SIM] QP rate limits: v_max torso/neck={cfg.ik.torso_neck_max_velocity:.1f}, "
-              f"arm={cfg.ik.arm_max_velocity:.1f} rad/s; "
-              f"a_max torso/neck={cfg.ik.torso_neck_max_acceleration:.0f}, "
-              f"arm={cfg.ik.arm_max_acceleration:.0f} rad/s^2")
+        print(f"[SIM] QP rate limits: v_max base_lin={cfg.ik.chassis_max_linear_velocity:.1f} m/s, "
+              f"base_yaw={cfg.ik.chassis_max_yaw_velocity:.1f}, "
+              f"torso/neck={cfg.ik.torso_neck_max_velocity:.1f}, "
+              f"arm={cfg.ik.arm_max_velocity:.1f} rad/s")
     else:
         print("[SIM] QP rate limits: DISABLED (enforce_limits=False)")
     smooth = [n for n, c in (("damping", cfg.ik.damping_cost),
@@ -218,6 +237,21 @@ def main() -> None:
     print(f"[SIM] Soft smoothing tasks: "
           f"{', '.join(smooth) if smooth else 'none'} "
           f"(damping_cost={cfg.ik.damping_cost:g}, low_accel_cost={cfg.ik.low_accel_cost:g})")
+    print(f"[SIM] Whole-body priority: arms/waist/lean first, then mobile base "
+          f"(damping: base={cfg.ik.damping_cost_chassis:g} > "
+          f"upper/lean={cfg.ik.damping_cost:g}).")
+    if cfg.ik.chest_over_ankle_cost > 0:
+        print(f"[SIM] Balance: chest (head/hip midpoint) kept over the ankle "
+              f"(chest_over_ankle_cost={cfg.ik.chest_over_ankle_cost:g}); "
+              f"trunk-pitch sum softly biased to ~0 "
+              f"(trunk_upright_cost={cfg.ik.trunk_upright_cost:g}).")
+    elif cfg.ik.trunk_upright_cost > 0:
+        print(f"[SIM] Balance: trunk kept vertical via lean-angle sum -> 0 "
+              f"(trunk_upright_cost={cfg.ik.trunk_upright_cost:g}); "
+              f"the two remaining spine DOFs stay free to squat.")
+    if cfg.ik.com_cost > 0:
+        print(f"[SIM] Balance (legacy): CoM kept over the base (com_cost={cfg.ik.com_cost:g} "
+              f"on horizontal, vertical={cfg.ik.com_cost_vertical:g} -> squat free).")
     print("[SIM] Waiting for AVP frames... (press 'c' to calibrate, space to pause)")
 
     n_steps_per_frame = max(1, int(round((1.0 / 60.0) / model.opt.timestep)))

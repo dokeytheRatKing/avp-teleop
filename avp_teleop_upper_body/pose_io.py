@@ -1,9 +1,12 @@
-"""Save / load a 20-DOF upper-body posture (torso + neck + both arms).
+"""Save / load a whole-body posture (chassis + torso + neck + both arms).
 
 A pose is stored as JSON keyed by *joint name* (not position), so it stays
 correct even if ``BODY_JOINTS`` order ever changes and is human-readable /
-hand-editable. Files live in :data:`POSE_DIR` (``avp_teleop_upper_body/poses``)
-and a bare name (``"reach_forward"``) resolves to ``poses/reach_forward.json``.
+hand-editable. Because it is name-keyed, an older 20-joint (pre-chassis) file
+still loads fine -- any joint missing from the file (e.g. the 3 base DOFs)
+defaults to its ``BODY_HOME`` value (the base at the origin). Files live in
+:data:`POSE_DIR` (``avp_teleop_upper_body/poses``) and a bare name
+(``"reach_forward"``) resolves to ``poses/reach_forward.json``.
 
 Used by both the interactive editor (:mod:`avp_teleop_upper_body.pose_editor`,
 which writes them) and the teleop loop (:mod:`avp_teleop_upper_body.sim_teleop`,

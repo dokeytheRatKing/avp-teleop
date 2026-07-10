@@ -1,9 +1,11 @@
 """Interactive MuJoCo pose editor for the Astribot S1 upper body.
 
-Open a live viewer, hand-pose the 20 upper-body joints (4-DOF torso, 2-DOF
-neck, two 7-DOF arms) with the keyboard, watch the result render in real time,
-then save it. Saved poses (:mod:`avp_teleop_upper_body.pose_io`) can be loaded
-as the teleop *initial / rest* posture via
+Open a live viewer, hand-pose the upper-body joints (4-DOF torso, 2-DOF neck,
+two 7-DOF arms) with the keyboard, watch the result render in real time, then
+save it. The 3 mobile-base DOFs are part of the body vector but are pinned at
+the origin here (an initial *rest* pose never displaces the base). Saved poses
+(:mod:`avp_teleop_upper_body.pose_io`) can be loaded as the teleop *initial /
+rest* posture via
 ``python -m avp_teleop_upper_body.sim_teleop --init-pose <name>``.
 
 The robot is fixed-base and every body joint is position-actuated, so the pose
@@ -46,7 +48,9 @@ from avp_teleop_upper_body.config import (
     MJCF_PATH,
     BODY_JOINTS,
     BODY_HOME,
+    CHASSIS_JOINTS,
     TORSO_JOINTS,
+    TORSO_LEAN_JOINTS,
     NECK_JOINTS,
     ARM_JOINTS,
 )
@@ -54,8 +58,12 @@ from avp_teleop_upper_body import pose_io
 
 
 def _group_of(joint: str) -> str:
+    if joint in CHASSIS_JOINTS:
+        return "base "
+    if joint in TORSO_LEAN_JOINTS:
+        return "lean "   # sagittal lean spine (torso_joint_1/2/3)
     if joint in TORSO_JOINTS:
-        return "torso"
+        return "waist"   # torso_joint_4: pure waist yaw
     if joint in NECK_JOINTS:
         return "neck "
     if joint in ARM_JOINTS["left"]:
@@ -87,7 +95,9 @@ def main() -> None:
     model = mujoco.MjModel.from_xml_path(mjcf_path)
     data = mujoco.MjData(model)
 
-    # qpos address + range + actuator id for each of the 20 body joints.
+    # qpos address + range + actuator id for each body joint. The 3 base joints
+    # are unlimited (jnt_range [0,0]) so they clamp to the origin -- intended for
+    # a rest pose; the editable joints are torso/neck/arms.
     qadr: List[int] = []
     lo = np.empty(len(BODY_JOINTS))
     hi = np.empty(len(BODY_JOINTS))
@@ -119,7 +129,7 @@ def main() -> None:
     state = {"sel": 0, "step": 0.05, "dirty": True}
 
     def apply() -> None:
-        """Write the 20 joint angles into qpos+ctrl and refresh kinematics.
+        """Write the body joint angles into qpos+ctrl and refresh kinematics.
 
         MAIN THREAD ONLY (called from the render loop under viewer.lock())."""
         for adr, ai, qi in zip(qadr, act, q):
@@ -145,11 +155,11 @@ def main() -> None:
         "S save | P print | H help"
     )
 
-    # Index ranges of the two 7-DOF arms inside BODY_JOINTS (torso 0-3, neck 4-5,
-    # L-arm 6-12, R-arm 13-19).
-    _L0 = len(TORSO_JOINTS) + len(NECK_JOINTS)          # 6
-    _R0 = _L0 + len(ARM_JOINTS["left"])                 # 13
-    _NARM = len(ARM_JOINTS["right"])                    # 7
+    # Index ranges of the two 7-DOF arms inside BODY_JOINTS (base 0-2, torso 3-6,
+    # neck 7-8, L-arm 9-15, R-arm 16-22).
+    _L0 = len(CHASSIS_JOINTS) + len(TORSO_JOINTS) + len(NECK_JOINTS)   # 9
+    _R0 = _L0 + len(ARM_JOINTS["left"])                                # 16
+    _NARM = len(ARM_JOINTS["right"])                                   # 7
     # Left->right MIRROR signs (per arm joint 1..7). Derived from a hand-made
     # symmetric pose: joints 1,3,5,7 flip sign, joints 2,4,6 keep it, so
     # right[k] = sign[k] * left[k] yields a sagittally symmetric posture.

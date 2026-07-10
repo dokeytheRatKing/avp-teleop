@@ -19,6 +19,14 @@ Run inside the `AVP` conda env (after starting avp_publisher in another shell):
 Viewer keys:
     c      (re)calibrate ALL arms: anchor each hand pose to its tool pose
     space  pause / resume teleop (sim keeps running)
+    r      start / stop trajectory recording (only when --record is set)
+
+Recording:
+    Pass ``--record PATH.json`` to capture the retargeted joint-space command
+    stream in the Astribot ROS2 joint-space format (see recording.py). Frames
+    are captured only while teleop is calibrated, not paused, and recording is
+    armed (toggle with 'r', or auto-armed with --record-autostart). The file is
+    written when the viewer closes. Replay it offline with ``replay_sim.py``.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ from avp_teleop.robot_interface import SimRobot
 from avp_teleop.retarget.arm_ik import ArmIK
 from avp_teleop.retarget.hand_retarget import HandRetargeter
 from avp_teleop.retarget.frames import WristCalibration, wrist_to_tool_target
+from avp_teleop.recording import TrajectoryRecorder
 
 
 @dataclass
@@ -143,6 +152,12 @@ def main() -> None:
                         choices=["pink", "mujoco"],
                         help="IK solver: 'pink' (Pinocchio+Pink, default) or "
                              "'mujoco' (legacy DLS fallback).")
+    parser.add_argument("--record", default=None, metavar="PATH.json",
+                        help="Record the retargeted joint-space trajectory to "
+                             "this JSON file (Astribot ROS2 format).")
+    parser.add_argument("--record-autostart", action="store_true",
+                        help="Arm recording immediately (else press 'r' to "
+                             "start). Only relevant with --record.")
     args = parser.parse_args()
 
     cfg.avp.side = args.side
@@ -166,11 +181,27 @@ def main() -> None:
 
     sub = HandFrameSubscriber(args.host, args.port, timeout_s=cfg.network.recv_timeout_s)
 
+    # --- optional trajectory recorder ---
+    recorder: Optional[TrajectoryRecorder] = None
+    if args.record:
+        finger_names = {
+            s: [jn for spec in cfg.finger_specs_for(s) for (jn, _w) in spec.joints]
+            for s in ("left", "right")
+        }
+        recorder = TrajectoryRecorder(
+            sides=sides,
+            source_model=mjcf_path,
+            nominal_dt=1.0 / 60.0,
+            finger_joint_names=finger_names,
+        )
+        print(f"[SIM] Recording -> {args.record} "
+              f"({'armed' if args.record_autostart else 'press r to start'})")
+
     # --- shared control state, mutated by the viewer key callback ---
-    state = {"paused": False}
+    state = {"paused": False, "recording": bool(args.record_autostart and recorder)}
 
     def key_callback(keycode: int) -> None:
-        # 'c' = 67, space = 32
+        # 'c' = 67, space = 32, 'r' = 82
         if keycode == 67:
             for ctrl in controllers:
                 ctrl.needs_calib = True
@@ -178,6 +209,10 @@ def main() -> None:
         elif keycode == 32:
             state["paused"] = not state["paused"]
             print(f"[SIM] {'Paused' if state['paused'] else 'Resumed'}.")
+        elif keycode == 82 and recorder is not None:
+            state["recording"] = not state["recording"]
+            print(f"[SIM] Recording {'STARTED' if state['recording'] else 'STOPPED'} "
+                  f"({recorder.n_frames} frames so far).")
 
     print(f"[SIM] Subscribing udp://{args.host}:{args.port}, sides={'+'.join(sides)}, "
           f"orientation={'on' if cfg.retarget.track_orientation else 'off'}")
@@ -194,6 +229,13 @@ def main() -> None:
             frames = sub.latest_by_side()
             if frames:
                 frames_seen += 1
+
+            # Record one frame per control tick while armed + actively driving.
+            capturing = (recorder is not None and state["recording"]
+                         and not state["paused"])
+            if capturing:
+                recorder.begin_frame(time.time())
+            captured_any = False
 
             for ctrl in controllers:
                 frame = frames.get(ctrl.side)
@@ -231,6 +273,17 @@ def main() -> None:
                     finger_targets = ctrl.hand.joint_targets(frame.keypoints, ctrl.ranges)
                     ctrl.robot.command_fingers(finger_targets)
 
+                    if capturing:
+                        recorder.set_arm(ctrl.side, q)
+                        recorder.set_hand(ctrl.side, finger_targets, ctrl.ranges)
+                        captured_any = True
+
+            if capturing:
+                if captured_any:
+                    recorder.commit_frame()
+                else:
+                    recorder._pending = None  # nothing driven this tick; drop it
+
             # Always step physics so the sim stays live even without data.
             for _ in range(n_steps_per_frame):
                 mujoco.mj_step(model, data)
@@ -240,12 +293,21 @@ def main() -> None:
             if now - last_status >= 2.0:
                 rate = frames_seen / (now - last_status)
                 tag = "tracking" if frames_seen else "NO DATA (is avp_publisher running?)"
-                print(f"[SIM] {tag} | frames {rate:.0f}/s", end="\r", flush=True)
+                rec_tag = ""
+                if recorder is not None:
+                    rec_tag = (f" | REC {recorder.n_frames}f"
+                               if state["recording"]
+                               else f" | rec paused ({recorder.n_frames}f)")
+                print(f"[SIM] {tag} | frames {rate:.0f}/s{rec_tag}",
+                      end="\r", flush=True)
                 frames_seen, last_status = 0, now
 
             time.sleep(max(0.0, 1.0 / 60.0 - 0.001))
 
     sub.close()
+    if recorder is not None:
+        recorder.save(args.record)
+        print(f"\n[SIM] Saved {recorder.n_frames} frames -> {args.record}")
     print("\n[SIM] Stopped.")
 
 

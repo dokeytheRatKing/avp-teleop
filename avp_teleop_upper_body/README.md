@@ -1,10 +1,10 @@
 # AVP → MuJoCo 上半身整体遥操 (avp_teleop_upper_body)
 
 在双臂遥操的基础上，**加入 Apple Vision Pro 头部 6DoF 数据**，用一个**合并求解器**同时驱动机器人的
-**躯干 + 脖子 + 左右双臂**，让整个上半身随操作者协同移动。
+**底盘 + 躯干 + 脖子 + 左右双臂**，让整个身体随操作者协同移动（真正的**全身重定向**）。
 
 ```
-Apple Vision Pro ──UDP──> 合并整体 IK (1 个 20-DOF Pink 求解器) ──> MuJoCo 仿真
+Apple Vision Pro ──UDP──> 合并整体 IK (1 个 23-DOF Pink 求解器) ──> MuJoCo 仿真
   头 + 左手 + 右手            whole_body_ik.py                       sim_teleop.py
 ```
 
@@ -12,40 +12,53 @@ Apple Vision Pro ──UDP──> 合并整体 IK (1 个 20-DOF Pink 求解器) 
 
 1. **头部跟随**：头戴显示器的位姿驱动机器人头部相机帧（脖子 2-DOF + 躯干 4-DOF 一起解）。
 2. **双臂跟随**：左右工具末端跟随你左右手腕——并且**手臂会自动补偿躯干的运动**（见下）。
-3. **手指开合**：每根手指的弯曲度映射到对应的 BrainCo 机械手关节。
+3. **底盘协同**：当目标超出手臂+躯干的可达范围时，**移动底盘**（平移 x/y + 偏航）帮忙够到——但**优先动手臂和腰、其次才动底盘**（按关节权重，见下）。
+4. **手指开合**：每根手指的弯曲度映射到对应的 BrainCo 机械手关节。
 
-> 这是 [`avp_teleop`](../avp_teleop/) 双臂版的**上半身扩展**。双臂版（躯干锁定、两臂各自独立求解）**完全不动**，仍可单独使用；本包是一个**独立的新包**。
+> **关于"下肢 / 髋膝关节"**：这台 Astribot S1 **没有独立的髋/膝/踝关节**，它的"下肢"由两部分构成，二者共同扮演腿的角色：
+> - **3-DOF 轮式移动底盘**（`chassis_x`/`_y` 平移 + `chassis_zrot` 偏航）——负责**水平移动**；
+> - **`torso_joint_1/2/3` 前倾脊柱**（经运动学扫描确认：这三个关节是**矢状面的前倾/下蹲机构**，相当于髋/膝——`+0.3 rad` 前倾会把整机重心水平移出 ~14 / 7 / 2 cm，是**过度补偿导致前倾/后仰失稳**的根源；`torso_joint_4` 才是纯粹的**腰部偏航**，不影响重心/高度，可自由动）。
+>
+> 所以用户要求的三级优先级"**手臂+腰 › 底盘 › 下肢（髋/膝）**"在本机上**完整成立**，落为：**{手臂 + 腰偏航 + 脖子} › {底盘} › {前倾脊柱 torso_joint_1/2/3}**。前倾脊柱被放到**最低优先级**（阻尼最大），只有需要真正改变**身体高度**（如下蹲够低处）时才大幅动它——因为无腿机器人只能靠这条脊柱升降身体。见下方"全身重定向与关节优先级"。
+
+> 这是 [`avp_teleop`](../avp_teleop/) 双臂版的**全身扩展**。双臂版（躯干锁定、两臂各自独立求解）**完全不动**，仍可单独使用；本包是一个**独立的新包**。
 
 ---
 
 ## 为什么是"合并求解器"（核心设计）
 
-机器人 `astribot_torso_link_4` 是**双臂和头的共同根**：
+机器人 `astribot_torso_link_4` 是**双臂和头的共同根**，而 `torso_joint_1..4` 又都长在**底盘**上：
 
 ```
-base → torso_joint_1..4 → torso_link_4 → { head_joint_1,2 ; 左臂×7 ; 右臂×7 }
+chassis(x,y,yaw) → torso_joint_1..4 → torso_link_4 → { head_joint_1,2 ; 左臂×7 ; 右臂×7 }
 ```
 
-一旦**躯干参与运动**，它就会带动两条手臂的基座——双臂版"躯干锁中立、两臂独立"的前提不再成立。
-因此本包把 **torso(4) + neck(2) + 左臂(7) + 右臂(7) = 20 个自由度**放进**同一个** Pinocchio + Pink
-配置里，一个 QP 同时求解四个加权任务：
+一旦**躯干/底盘参与运动**，它们就会带动两条手臂的基座——双臂版"躯干锁中立、两臂独立"的前提不再成立。
+因此本包把 **底盘(3) + torso(4) + neck(2) + 左臂(7) + 右臂(7) = 23 个自由度**放进**同一个** Pinocchio + Pink
+配置里，一个 QP 同时求解这些加权任务：
 
-| 任务                    | 帧                                 | 作用                                                               |
-| ----------------------- | ---------------------------------- | ------------------------------------------------------------------ |
-| `FrameTask`           | `astribot_head_camera_base_link` | 跟踪 AVP 头部 6DoF 目标（主要驱动 torso+neck）                     |
-| `FrameTask`           | `astribot_arm_left_tool_link`    | 跟踪左手目标                                                       |
-| `FrameTask`           | `astribot_arm_right_tool_link`   | 跟踪右手目标                                                       |
-| `PostureTask`         | →`BODY_HOME`                    | 解 20-DOF 冗余：躯干偏向直立、肘腕自然（稳定性关键）               |
-| `DampingTask`         | 全关节                             | 软惩罚`‖v‖`（关节速度）→ 抑制零空间速度、无人驱动时收敛到静止 |
-| `LowAccelerationTask` | 全关节                             | 软惩罚`‖v−v_prev‖`（帧间加速度）→ 降低急动(jerk)、更顺滑     |
+| 任务                    | 帧                                 | 作用                                                                                                      |
+| ----------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `FrameTask`           | `astribot_head_camera_base_link` | 跟踪 AVP 头部 6DoF 目标（主要驱动 torso+neck）                                                            |
+| `FrameTask`           | `astribot_arm_left_tool_link`    | 跟踪左手目标                                                                                              |
+| `FrameTask`           | `astribot_arm_right_tool_link`   | 跟踪右手目标                                                                                              |
+| `PostureTask`         | →`BODY_HOME`                    | 解 23-DOF 冗余：躯干偏向直立、肘腕自然、**底盘回到原点**（稳定性关键）                              |
+| `ComTask`（水平）     | 整机重心 → 底盘上方             | **平衡约束**：只罚重心的**水平**偏移（防前倾/后仰失稳），**竖直方向权重=0**（下蹲升降高度不受限）      |
+| `DampingTask`         | 全关节（**逐关节权重**）     | 软惩罚`‖v‖`（关节速度）→ 抑制零空间速度 + **编码全身三级运动优先级**（前倾脊柱 > 底盘 > 上半身，见下） |
+| `LowAccelerationTask` | 全关节                             | 软惩罚`‖v−v_prev‖`（帧间加速度）→ 降低急动(jerk)、更顺滑                                            |
 
-因为三个末端任务**共享同一配置**，当头部目标让躯干前倾时，两个手臂任务会**在同一次求解里**把手臂解到
-"手仍在各自世界目标"的构型——这就是**自动补偿躯干运动**，无需任何手写坐标修正。这正是
-VisionProTeleop `examples/11_diffik_aloha.py` 的合并双臂模式（两臂 FrameTask + PostureTask），
-本包在它之上加了一个头部任务，并用 Pink（而非 mink）实现，与项目既有 IP 栈一致。
+因为三个末端任务**共享同一配置**：当头部目标让躯干前倾时，两个手臂任务会**在同一次求解里**把手臂解到
+"手仍在各自世界目标"的构型；当目标够不到时，**底盘平移/转向**来延伸可达范围——这就是**自动补偿 + 全身协同**，
+无需任何手写坐标修正。这正是 VisionProTeleop `examples/11_diffik_aloha.py` 的合并双臂模式（两臂 FrameTask +
+PostureTask），本包在它之上加了一个头部任务 + 一个移动底盘，并用 Pink（而非 mink）实现，与项目既有 IP 栈一致。
 
 帧一致性沿用既有做法：模型由**展平后的同一 MJCF** 构建，三个末端帧与 MuJoCo 逐构型吻合到 <1e-4 m，
 解出的关节角**零坐标变换**直接写入仿真（详见 [whole_body_ik.py](whole_body_ik.py) 顶部说明）。
+
+> **底盘的复合关节**：Pinocchio 的 MJCF 解析器会把底盘 3 个关节**合并**成**一个** 3-DOF 复合关节
+> `Composite_astribot_chassis_x`（内部 DOF 顺序 x, y, yaw，与 MuJoCo 一致）。所以求解器内部用**约简模型的关节名**
+> （底盘=复合关节，即 `IK_KEEP_JOINTS`），而对外返回的 23 维指令向量按 `BODY_JOINTS`（底盘拆成 x/y/yaw 三项）排列——
+> 两者逐 DOF 对齐（自检里 round-trip 实测 0.00 mm）。多 DOF 关节被自动展开成各自的切空间 DOF，下游无需特判。
 
 ---
 
@@ -74,7 +87,7 @@ cd /Users/apple/vscodeProject/AVP
 python -m avp_teleop_upper_body.selfcheck
 ```
 
-应当看到 `9/9 checks passed.`（含**合并求解一致性**、**自动补偿**、**位姿滤波**、**速度/加速度硬约束**与**软平滑任务**五项关键校验）。
+应当看到 `11/11 checks passed.`（含**合并求解一致性**、**自动补偿**、**全身底盘优先级**、**重心平衡/前倾脊柱优先级**、**位姿滤波**、**速度/加速度硬约束**与**软平滑任务**等关键校验）。
 
 ### 第二步：启动发布端（戴上 Vision Pro）
 
@@ -167,6 +180,10 @@ AVP 的头/腕位姿有跟踪抖动、偶发丢帧，直接喂给求解器会让
 > teleop MJCF **没有**声明速度限位，所以 `v_max` 来自 [config.py](config.py) 的 `WholeBodyIKConfig`
 > （torso/neck 默认 1.8 rad/s、手臂 3.0 rad/s；加速度 60 / 100 rad/s²）。手臂的 `v_max=3.0` 恰好等于旧的
 > `arm_max_step=0.05 rad/拍 @60Hz`，所以默认行为与之前的限速一致，但更平滑、且物理正确。
+>
+> **底盘**是移动底座，x/y 是**平移**（单位米），所以它们的上限是 **m/s、m/s²**（默认 0.6 m/s、4 m/s²），
+> 而偏航 `zrot` 是**旋转**（1.2 rad/s、20 rad/s²）。`pink.limits` 逐切空间 DOF 施加上限，不假设"全是旋转关节"，
+> 所以公制与角度上限可以在同一条约束里共存。
 
 每次按 `c` 重标定会调用 `ik.reset()`，**从静止重新加速**，不把旧速度带过重锚跳变。极少数情况下
 （贴着关节限位时速度盒与加速度刹车盒可能无交集）会自动**降级**（丢掉该拍的加速度约束，必要时保持不动），
@@ -179,7 +196,7 @@ AVP 的头/腕位姿有跟踪抖动、偶发丢帧，直接喂给求解器会让
 
 硬约束是**不可逾越的物理上限**；软平滑任务则在**上限以内**进一步塑形运动，让它"平顺"而不是"贴着上限猛冲"。求解器额外挂了两个 [pink.tasks](whole_body_ik.py) 的低权重任务：
 
-- `DampingTask`：惩罚 `‖v‖`（关节速度）。像"阻尼/摩擦"一样把多余速度泄掉——尤其是 20-DOF 链跟踪 ≤18 维任务时多出来的**零空间速度**（避免内部自由度乱漂），并在无目标驱动时让关节收敛到静止。
+- `DampingTask`：惩罚 `‖v‖`（关节速度）。像"阻尼/摩擦"一样把多余速度泄掉——尤其是 23-DOF 链跟踪 ≤18 维任务时多出来的**零空间速度**（避免内部自由度乱漂），并在无目标驱动时让关节收敛到静止。**此外它的逐关节权重还编码全身运动优先级**（底盘权重远高于上半身，见"全身重定向与底盘优先级"节）。
 - `LowAccelerationTask`：惩罚 `‖v − v_prev‖`（帧间加速度）。它**有状态**：每拍解完把该拍速度喂给它（`set_last_integration`），下一拍即惩罚速度变化 → 降低急动(jerk)、抗目标抖动。Pink 文档明确建议它**与 `DampingTask` 搭配**（单用它不耗散能量、会自激振荡），所以两个一起加。
 
 > 两个 cost 都**远小于**末端跟踪 cost（手臂 10 / 头 3），默认各 `0.1`（≈100× 低于手臂跟踪）。**这是有意的**：默认权重对"手要去哪"的主运动几乎无影响（自检实测默认权重对大幅 slew 的峰值速度影响 <0.1%），它们的真正作用是**零空间阻尼 + 降 jerk**。想要更明显的平滑就**调大** `damping_cost`/`low_accel_cost`，代价是略增滞后/稳态偏移；设为 `0` 即关掉对应任务做 A/B 对比。
@@ -188,9 +205,37 @@ AVP 的头/腕位姿有跟踪抖动、偶发丢帧，直接喂给求解器会让
 
 ---
 
+## 全身重定向与关节优先级（逐关节权重 + 重心平衡）
+
+本包把**移动底盘**和**整条躯干**都解锁进同一个求解器，成为真正的全身 IK。用户要求"**优先动手臂和腰，其次动底盘，最后动下肢（髋/膝）**"——这台 S1 的"下肢"由**底盘**（水平移动）+ **前倾脊柱 `torso_joint_1/2/3`**（升降/前倾，相当于髋膝）共同承担，于是完整落为**三级优先级**。实现机制正是用户要的"**给不同关节分配不同权重**"：
+
+- **优先级 = `DampingTask` 的逐关节速度权重**。cost 可以是一个**逐 DOF 向量**（Pink 内部按 `diag(cost²)` 进 QP 的 Hessian），cost 越大 → 该关节速度越"贵" → QP 越不愿动它 → **越晚被调用**。三级（由先到后 / 由便宜到贵）：
+  - **手臂 + 腰偏航(`torso_joint_4`) + 脖子**：**小** cost（`damping_cost=0.1`）→ 先动、且兼作平滑阻尼；
+  - **底盘 x/y/yaw**：**中** cost（`damping_cost_chassis=20`）→ 上半身够不到时才平移/转向延伸；
+  - **前倾脊柱 `torso_joint_1/2/3`**：**最大** cost（`damping_cost_lean=40`）→ **最后动**。因为前倾会把重心移出轮子基座（失稳/前倾后仰），所以要让 QP 先用手臂、再转腰、再挪底盘，实在够不到、且是**持续**的目标才前倾。
+- **为什么底盘/前倾要高权重？** 底盘平移对末端的雅可比≈单位（挪底盘 1 cm，手就走 1 cm），是"移动手"最省力的方式；前倾脊柱同理还更省。若不重罚，QP 会**优先挪底盘/前倾而不是伸手**（这正是原来"过度补偿前倾失稳"的原因）。加大阻尼后：正常伸手底盘/躯干几乎不动，只有目标明显够不到才依次动它们。
+- **`ComTask` 重心平衡（第二道防线）**：一个重心任务把整机**水平**重心钉在底盘正上方，直接惩罚"重心偏出底盘"的前倾/后仰；**竖直方向权重设为 0**，所以机器人**仍可自由升降重心（下蹲）**。它随底盘一起平移（底盘走到哪，平衡目标跟到哪），所以**只罚前倾、不罚走底盘**。
+
+**关键权衡**（自检 `check_balance` 实测）：普通前伸/前下伸手，躯干只前倾 ~2.6°、重心离底盘仅 ~4.5 cm（**不再过度补偿前倾**）；而**真正的下蹲**（头和手一起下降）仍会前倾 ~15.6° 去改变身体高度——因为无腿机器人只能靠这条脊柱升降。**注意 `damping_cost_lean` 必须有限**，否则脊柱被冻住就再也蹲不下去了。
+
+调 `damping_cost_chassis` / `damping_cost_lean` / `com_cost`（[config.py](config.py) 的 `WholeBodyIKConfig`）：
+
+| 参数                             | 默认 | 效果                                               |
+| ------------------------------ | ---- | -------------------------------------------------- |
+| `damping_cost`（上半身）        | 0.1  | 手臂/腰偏航/脖子最先动。                            |
+| `damping_cost_chassis`（底盘）  | 20   | 其次动；调大=底盘更懒，调小=更跟手，=`damping_cost` 即平权。 |
+| `damping_cost_lean`（前倾脊柱） | 40   | 最后动；调大=躯干更"直挺"、更难蹲，调小=更易前倾/下蹲。 |
+| `com_cost`（水平重心）          | 3.0  | 平衡强度；调大=更"端正稳定"（前倾更受限），0=关闭平衡任务。 |
+| `com_cost_vertical`（竖直重心） | 0.0  | 保持 0 → 下蹲升降不受限；>0 会开始约束身体高度。   |
+
+> 底盘位置**无限位**（可无限行走）；求解器靠 `PostureTask`（home=原点）在底盘/躯干不再被需要时把它们**慢慢拉回原点**，避免长期漂移。
+> 三级优先级是**数据驱动**的（见 `WholeBodyIKConfig.damping_costs()` / `_assemble()`）：将来换成有独立髋/膝的**有腿**机型，只需把这些关节归入对应的权重档即可，代码结构不变。
+
+---
+
 ## 调整 / 保存初始姿态（姿态编辑器）
 
-`pose_editor.py` 让你在 MuJoCo 窗口里**手动摆好上半身的 20 个关节**（躯干 4 + 脖子 2 + 左右臂各 7），
+`pose_editor.py` 让你在 MuJoCo 窗口里**手动摆好身体关节**（躯干 4 + 脖子 2 + 左右臂各 7；底盘 3 项固定在原点、不参与编辑），
 **实时看到效果**，满意后**保存**；保存的姿态可被 `sim_teleop --init-pose` 选为遥操的**初始/静止姿态**。
 
 > 机器人是固定底座、每个 body 关节都有位置执行器，所以编辑器**纯运动学**摆位（只 `mj_forward`，不跑物理）——
@@ -219,7 +264,7 @@ python -m avp_teleop_upper_body.pose_editor --inname my_pose --outname my_pose1
 
 | 键               | 作用                                                                            |
 | ---------------- | ------------------------------------------------------------------------------- |
-| `↑` / `↓`  | 选择上一个 / 下一个关节（在 20 个 body 关节间循环）                             |
+| `↑` / `↓`  | 选择上一个 / 下一个关节（在 body 关节间循环）                             |
 | `←` / `→`  | 把当前关节角**减小 / 增大**一个步长（自动限位钳制）                       |
 | `[` / `]`    | 步长**减半 / 加倍**（默认 0.05 rad）                                      |
 | `0`            | 当前关节复位到 home                                                             |
@@ -257,62 +302,75 @@ python -m avp_teleop_upper_body.sim_teleop --init-pose my_pose
 
 ```
 avp_teleop_upper_body/
-  config.py          # torso/neck 关节名、HEAD_FRAME_BODY、20-DOF BODY_JOINTS 顺序 + BODY_HOME、合并 IK 权重
+  config.py          # 底盘/torso(含前倾脊柱)/neck 关节名、HEAD_FRAME_BODY、CHASSIS_BASE_FRAME、23-DOF BODY_JOINTS 顺序 + BODY_HOME、合并 IK 权重 + 三级关节优先级 + 重心平衡
   transport.py       # HeadFrame(magic AVPE) + HeadFramePublisher + UpperBodySubscriber(单端口按 magic 分发)
-  whole_body_ik.py   # WholeBodyIK：合并 Pink 求解器(头/左/右 三个 FrameTask + 一个 PostureTask) + 速度/加速度硬约束 + 软平滑任务(Damping/LowAcceleration)
+  whole_body_ik.py   # WholeBodyIK：合并 Pink 求解器(头/左/右 FrameTask + ComTask 重心平衡 + PostureTask) + 速度/加速度硬约束 + 软平滑任务(Damping/LowAcceleration) + 逐关节三级优先级(前倾脊柱>底盘>上半身)
   avp_publisher.py   # 连 AVP，每拍发 头 + 左手 + 右手
-  sim_teleop.py      # 合并求解器主循环：poll → 三目标 → solve(20-DOF) → 写 ctrl → 步进 + 渲染
+  sim_teleop.py      # 合并求解器主循环：poll → 三目标 → solve(23-DOF) → 写 ctrl → 步进 + 渲染
   pose_filter.py     # 位姿滤波：平移 EMA + 旋转 SLERP(pinocchio)，sim_teleop 进求解前对三目标平滑
-  pose_editor.py     # 交互式姿态编辑器：键盘摆 20 个关节、实时渲染、保存初始姿态
+  pose_editor.py     # 交互式姿态编辑器：键盘摆 torso/neck/双臂(底盘钉在原点)、实时渲染、保存初始姿态
   pose_io.py         # 姿态存取(JSON，按关节名)；sim_teleop --init-pose / pose_editor 共用
   poses/             # 保存的姿态(<name>.json)
-  selfcheck.py       # 离线自检(9 项)
+  selfcheck.py       # 离线自检(11 项)
 ```
 
 **复用 [`avp_teleop`](../avp_teleop/)（import，不复制不改动）**：`HandFrame`/`HandFramePublisher`（transport）、
 `WristCalibration`/`wrist_to_tool_target`（frames）、`HandRetargeter`（hand_retarget）、`SimRobot`
 （robot_interface）、`MJCF_PATH`/`ARM_JOINTS`/`TOOL_BODY`/`ARM_HOME`/`AVP_TO_ROBOT_R`/`_finger_specs`（config）。
 
-> 同一个 `SimRobot` 实例驱动全部 20 个 body 关节（`arm_joint_names` = `BODY_JOINTS`）+ 双手全部手指；
-> 头相机帧作为它的 `tool_body`（供头部标定读位姿）。torso(4)+neck(2) 的 position 执行器在 stock
+> 同一个 `SimRobot` 实例驱动全部 23 个 body 关节（`arm_joint_names` = `BODY_JOINTS`，含底盘 3 个位置执行器）+ 双手全部手指；
+> 头相机帧作为它的 `tool_body`（供头部标定读位姿）。底盘 x/y/yaw 与 torso(4)+neck(2) 的 position 执行器在 stock
 > `astribot_s1_actuator_for_hand.xml` 里**本就存在**，故 **teleop MJCF 不需改动**。
 
 ---
 
 ## 调参指南（都在 [config.py](config.py) 的 `WholeBodyIKConfig`）
 
-| 参数                            | 作用                                       | 调整方向                                           |
-| ------------------------------- | ------------------------------------------ | -------------------------------------------------- |
-| `arm_position_cost`           | 手臂末端跟随权重                           | 默认 10（高于头部，保证抓取精度优先）              |
-| `head_position_cost`          | 头部位置跟随权重                           | 默认 3（中等，避免头部猛拽躯干）；想头更跟手→调大 |
-| `head_orientation_cost`       | 头部朝向(注视)权重                         | 仅`head_track_orientation=True` 用               |
-| `arm_orientation_cost`        | 手腕姿态权重                               | 仅`--orientation` 用                             |
-| `posture_cost`                | 偏向`BODY_HOME` 的零空间正则             | 躯干乱晃/不自然 → 调大（更"端正"但跟随略松）      |
-| `lm_damping`                  | LM 阻尼(抗奇异)                            | 近奇异抖动 → 调大；跟随发钝 → 调小               |
-| `torso_neck_max_velocity`     | torso/neck 速度上限(rad/s)                 | 躯干猛甩 → 调小（默认 1.8，比手臂更小）           |
-| `arm_max_velocity`            | 手臂速度上限(rad/s)                        | 默认 3.0（≈旧的 0.05 rad/拍 @60Hz）               |
-| `torso_neck_max_acceleration` | torso/neck 加速度上限(rad/s²)             | 起步/变向发冲 → 调小（默认 60，更平滑但更钝）     |
-| `arm_max_acceleration`        | 手臂加速度上限(rad/s²)                    | 默认 100；调小=更平滑的加减速                      |
-| `config_limit_gain`           | 远离关节限位的转向增益(0~1)                | 默认 0.5                                           |
-| `damping_cost`                | 关节速度软惩罚`‖v‖`(零空间阻尼)        | 默认 0.1；想更顺滑/抗漂→调大（略增滞后），0=关    |
-| `low_accel_cost`              | 帧间加速度软惩罚`‖v−v_prev‖`(降 jerk) | 默认 0.1；抖动明显→调大，0=关                     |
-| `head_position_scale`         | 头部位移放大                               | 默认 1.0；上半身够不到 → 调大（保持正值）         |
+| 参数                                | 作用                                                | 调整方向                                            |
+| ----------------------------------- | --------------------------------------------------- | --------------------------------------------------- |
+| `arm_position_cost`               | 手臂末端跟随权重                                    | 默认 10（高于头部，保证抓取精度优先）               |
+| `head_position_cost`              | 头部位置跟随权重                                    | 默认 3（中等，避免头部猛拽躯干）；想头更跟手→调大  |
+| `head_orientation_cost`           | 头部朝向(注视)权重                                  | 仅`head_track_orientation=True` 用                |
+| `arm_orientation_cost`            | 手腕姿态权重                                        | 仅`--orientation` 用                              |
+| `posture_cost`                    | 偏向`BODY_HOME` 的零空间正则                      | 躯干乱晃/不自然 → 调大（更"端正"但跟随略松）       |
+| `lm_damping`                      | LM 阻尼(抗奇异)                                     | 近奇异抖动 → 调大；跟随发钝 → 调小                |
+| `torso_neck_max_velocity`         | torso/neck 速度上限(rad/s)                          | 躯干猛甩 → 调小（默认 1.8，比手臂更小）            |
+| `arm_max_velocity`                | 手臂速度上限(rad/s)                                 | 默认 3.0（≈旧的 0.05 rad/拍 @60Hz）                |
+| `chassis_max_linear_velocity`     | 底盘平移速度上限(**m/s**)                     | 默认 0.6；底盘冲太快 → 调小                        |
+| `chassis_max_yaw_velocity`        | 底盘偏航速度上限(rad/s)                             | 默认 1.2                                            |
+| `torso_neck_max_acceleration`     | torso/neck 加速度上限(rad/s²)                      | 起步/变向发冲 → 调小（默认 60，更平滑但更钝）      |
+| `arm_max_acceleration`            | 手臂加速度上限(rad/s²)                             | 默认 100；调小=更平滑的加减速                       |
+| `chassis_max_linear_acceleration` | 底盘平移加速度上限(**m/s²**)                 | 默认 4.0                                            |
+| `chassis_max_yaw_acceleration`    | 底盘偏航加速度上限(rad/s²)                         | 默认 20.0                                           |
+| `config_limit_gain`               | 远离关节限位的转向增益(0~1)                         | 默认 0.5                                            |
+| `damping_cost`                    | **上半身**关节速度软惩罚`‖v‖`(零空间阻尼) | 默认 0.1；想更顺滑/抗漂→调大（略增滞后），0=关     |
+| `damping_cost_chassis`            | **底盘**速度软惩罚 = 优先级第 2 档           | 默认 20（底盘"其次"动）；调大=底盘更懒，调小=更跟手 |
+| `damping_cost_lean`               | **前倾脊柱**(torso_joint_1/2/3)速度软惩罚 = 优先级第 3 档（最后动） | 默认 40（"最后"动、防前倾失稳）；调大=躯干更直挺更难蹲，调小=更易前倾/下蹲 |
+| `com_cost`                        | **水平重心**平衡软惩罚（防前倾/后仰失稳）    | 默认 3.0；调大=更端正稳定，0=关闭平衡                |
+| `com_cost_vertical`               | **竖直重心**惩罚（身体高度）                 | 默认 0.0=下蹲升降自由；>0 才约束高度                 |
+| `low_accel_cost`                  | 帧间加速度软惩罚`‖v−v_prev‖`(降 jerk)          | 默认 0.1；抖动明显→调大，0=关                      |
+| `head_position_scale`             | 头部位移放大                                        | 默认 1.0；上半身够不到 → 调大（保持正值）          |
 
 ---
 
 ## 我已经离线验证过的部分
 
-`python -m avp_teleop_upper_body.selfcheck`（在 AVP 环境实跑通过，`9/9 checks passed.`）：
+`python -m avp_teleop_upper_body.selfcheck`（在 AVP 环境实跑通过，`11/11 checks passed.`）：
 
 - ✅ 传输：`HeadFrame` 编解码往返 + 同端口 头/左/右 三类消息按 magic 正确分发
 - ✅ **位姿滤波**：alpha=1.0 透传、alpha=0.5 平移取中点 + 旋转 SLERP 取半角且仍是合法旋转、
   `reset` 后下一帧原样、未跟踪朝向时只滤平移
-- ✅ 遥操 MJCF 加载，**20 个 body 执行器 + 30 个手指执行器**全部解析
+- ✅ 遥操 MJCF 加载，**23 个 body 执行器（含底盘 3）+ 30 个手指执行器**全部解析
 - ✅ **合并求解一致性（load-bearing）**：对一个可达构型的 头/左/右 三个目标，从 home 迭代求解后，
-  MuJoCo 下三个末端位置误差均 **< 0.8 mm** 且在限位内——证明 Pinocchio(展平 MJCF) 与 MuJoCo
+  MuJoCo 下三个末端位置误差均 **< 1 mm** 且在限位内——证明 Pinocchio(展平 MJCF) 与 MuJoCo
   对三个帧均逐构型一致、零变换
-- ✅ **自动补偿（关键不变量）**：给一个让躯干大幅前倾的整体目标，求解后**躯干确实移动**（~0.18 rad）
+- ✅ **自动补偿（关键不变量）**：给一个让躯干大幅**转腰**的整体目标，求解后**躯干确实移动**（~0.45 rad）
   **且 头 + 双手三个末端仍贴合各自目标**（误差 < 5 mm）——证明手臂在同一次求解里补偿了躯干运动
+- ✅ **全身底盘优先级**：(a) 复合底盘关节的 x/y/yaw 顺序与 `BODY_JOINTS` **round-trip 一致（0.00 mm）**——
+  证明求解器返回的 23 维向量驱动的是正确的底盘执行器；(b) **可达目标底盘几乎不动**（~3.7 cm）、
+  **够不到的远目标底盘明显平移过去且跟踪到位**（~46 cm / <10 mm）——证明底盘是"最后手段"而非"抢着动"
+- ✅ **重心平衡 / 前倾脊柱优先级**：普通前伸/前下伸手，躯干只前倾 ~2.6°、重心离底盘仅 ~4.5 cm（**不再过度补偿前倾失稳**）；
+  而**真正的下蹲**（头+手一起下降）仍前倾 ~15.6° 去改变身体高度——证明前倾脊柱被正确放到最低优先级、**又没被冻死**（仍能蹲）
 - ✅ **速度/加速度硬约束**：把求解器拉向一个较远目标后，**没有任何关节超过其速度上限**，**首拍从静止起步
   受 `a_max·dt` 限制**（加速度限幅在起作用，而非直接跳到速度上限），且速度上限确实被触及、`reset()` 清空加速度状态
 - ✅ **软平滑任务**：默认(温和)权重下整链仍精确跟踪(<5 mm)；放大 `damping_cost` 后峰值关节速度显著下降、
@@ -354,6 +412,7 @@ avp_teleop_upper_body/
 ## 将来怎么接真机 / ROS
 
 与双臂版一致：`avp_teleop/robot_interface.py` 已把机器人抽象成 `RobotInterface`，真机实现 `ROSRobot` 即可。
-合并求解器输出一个 20 维上半身关节向量，天然对应真机的**上半身整体控制器**（真实人形机器人通常也是
-一个 whole-body 控制器，而非按肢体拆分），把 `command_arm(q20)` 接到 Astribot 的关节话题即可，主循环与
-映射逻辑不变。
+合并求解器输出一个 **23 维全身关节向量（底盘 3 + torso 4 + neck 2 + 双臂 14）**，天然对应真机的**全身控制器**
+（真实人形/移动机器人通常也是一个 whole-body 控制器，而非按肢体拆分）：把上半身 20 维接 Astribot 的关节话题、
+底盘 3 维（x/y 速度 + 偏航）接底盘运动话题即可，主循环与映射逻辑不变。底盘优先级完全由 `damping_cost_chassis`
+一个权重决定，与真机无关。

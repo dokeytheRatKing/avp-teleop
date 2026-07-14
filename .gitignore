@@ -38,6 +38,10 @@ my_clip.json
 *_clip.json
 recordings/
 
+# EgoPoser 预训练权重(从官方 Google Drive 下载,体积大~200MB,不入库)
+# 用 EgoPoserEstimator.download_weights() 下载到这里; config 会自动发现 egoposer.pth
+avp_teleop_upper_body/egoposer/model_zoo/
+
 # ================================================================
 # Claude 内部记忆（只对你自己有用）
 # ================================================================

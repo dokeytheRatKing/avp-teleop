@@ -40,3 +40,10 @@ gdown==6.1.0
 requests==2.34.2
 PyYAML==6.0.3
 tqdm==4.68.2
+
+# ---- EgoPoser 神经先验（可选，仅 --egoposer 时需要）----
+# 只在启用 EgoPoser 躯干先验时才需要 torch；默认遥操作路径不导入 torch。
+# CPU 版即可（网络只有 3 层 transformer，单次推理 ~3 ms，60Hz 绰绰有余）。
+# 权重来自官方 Google Drive（见 avp_teleop_upper_body/egoposer 与 README），
+# gdown 已在上面列出，可用 EgoPoserEstimator.download_weights() 下载。
+torch>=2.2,<2.6

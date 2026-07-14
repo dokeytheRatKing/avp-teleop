@@ -14,6 +14,10 @@ One differential-IK problem drives the entire body -- a 3-DOF mobile base
                                  angle SUM (= trunk pitch) toward ~0 to tidy the
                                  lean redundancy (low cost; the two free spine
                                  DOFs stay free to fold into a squat)
+    * NeuralPostureTask       -> optional EgoPoser prior (OFF by default): bias
+                                 the trunk pitch (lean sum) + waist yaw toward a
+                                 human posture hallucinated from head/hand poses;
+                                 LOW cost, so balance + hand precision override it
     * ComTask(horizontal)     -> optional legacy mass-based balance (OFF by
                                  default; superseded by the two tasks above, which
                                  are base-invariant and do not creep the base)
@@ -156,6 +160,96 @@ class TrunkUprightTask(Task):
         return f"TrunkUprightTask(cost={self.cost})"
 
 
+class NeuralPostureTask(Task):
+    r"""Track a neural (EgoPoser) trunk-posture prior at low cost.
+
+    This is the QP-side of the EgoPoser kinematic prior (see
+    :mod:`avp_teleop_upper_body.egoposer`). Where :class:`TrunkUprightTask`
+    biases the trunk toward *upright* (lean-angle sum -> 0), this task biases it
+    toward the posture a human operator would actually adopt for the current
+    head/hand configuration, as hallucinated by EgoPoser and retargeted to the
+    robot's two realisable trunk DOFs:
+
+        * TRUNK PITCH -- the forward lean, tracked on the ``pitch`` joint set
+          supplied by the caller (see ``pitch_q_index``). The default wiring
+          uses ONLY the HIP joint (torso_joint_3), so the pitch target is the
+          human's chest-relative-to-pelvis flexion applied at the one hinge that
+          is anatomically "upper-body over lower-body" -- a frame-consistent
+          map (human spine vs pelvis  <->  robot upper trunk vs thigh). This is
+          deliberately NOT the full lean sum theta_1+theta_2+theta_3 (= trunk
+          pitch relative to the GROUND): tracking the sum makes the prior fight
+          :class:`ChestOverAnkleTask` for the very same "trunk-over-ground"
+          quantity, so balance (cost 50) simply attenuates the low-cost prior
+          (~0.8) and little human posture survives. Tracking the hip joint alone
+          leaves theta_1/theta_2 FREE for the balance task to counter-rotate
+          (ankle/knee sit back to keep the chest over the ankle), so the prior
+          and balance act on near-orthogonal directions and BOTH can be
+          satisfied: the robot hinges forward at the hip like a person while
+          staying balanced. (Because the S1 has no pitch DOF above the hip, this
+          "hip hinge" is the only way it can realise a forward lean at all.)
+        * WAIST YAW   -- axial twist, realised by torso_joint_4.
+
+    The error is the 2-vector
+
+        e = [ sum(theta_pitch) - pitch_target ,  theta_waist - yaw_target ]
+
+    where ``theta_pitch`` is the (usually single-joint) pitch set. The Jacobian
+    is CONSTANT (a row of ones on the pitch tangent DOFs, and a single one on the
+    waist tangent DOF). Like the other trunk tasks it is a pure function of the
+    joint angles, hence **base-invariant** -- it cannot drive or creep the
+    mobile base.
+
+    It is deliberately run at a LOW cost, well below the balance
+    (:class:`ChestOverAnkleTask`) and end-effector tracking costs, so it only
+    shapes the trunk's null-space toward a more human posture and is overridden
+    whenever it would fight balance or hand precision. The target is refreshed
+    each control tick via :meth:`WholeBodyIK.set_neural_target`; before any
+    target is set (or when the estimator yields nothing) it defaults to the
+    upright posture (0, 0), which is safe.
+
+    NOTE on TrunkUprightTask: with the hip-only pitch map the two tasks no
+    longer fight over the same quantity (upright pulls the SUM to 0; this pulls
+    the HIP to the target). Still, to let the hip bias survive, WholeBodyIK's
+    caller (sim_teleop) DISABLES the trunk-upright pitch regulariser while the
+    neural prior is active -- otherwise upright would force theta_1+theta_2 to
+    cancel the hip angle back toward a ground-vertical trunk.
+    """
+
+    def __init__(self, pitch_v_index, pitch_q_index, waist_v_index, waist_q_index,
+                 cost, gain=1.0, lm_damping=0.0):
+        # cost may be a scalar (applied to both rows) -> Pink expands it.
+        super().__init__(cost=cost, gain=gain, lm_damping=lm_damping)
+        # pitch_*_index: the joint DOF(s) that realise the tracked forward lean.
+        # A single index (hip only) is the default; a multi-index set sums to a
+        # "trunk pitch relative to ground" as the legacy behaviour did.
+        self.pitch_v_index = list(pitch_v_index)
+        self.pitch_q_index = list(pitch_q_index)
+        self.waist_v_index = int(waist_v_index)
+        self.waist_q_index = int(waist_q_index)
+        self.pitch_target = 0.0
+        self.yaw_target = 0.0
+
+    def set_target(self, pitch: float, yaw: float) -> None:
+        self.pitch_target = float(pitch)
+        self.yaw_target = float(yaw)
+
+    def compute_error(self, configuration: pink.Configuration) -> np.ndarray:
+        pitch = sum(configuration.q[i] for i in self.pitch_q_index)
+        waist = configuration.q[self.waist_q_index]
+        return np.array([pitch - self.pitch_target,
+                         waist - self.yaw_target])
+
+    def compute_jacobian(self, configuration: pink.Configuration) -> np.ndarray:
+        J = np.zeros((2, configuration.model.nv))
+        J[0, self.pitch_v_index] = 1.0    # pitch row: the pitch DOF(s) (hip only)
+        J[1, self.waist_v_index] = 1.0    # yaw row: the waist DOF
+        return J
+
+    def __repr__(self) -> str:
+        return (f"NeuralPostureTask(cost={self.cost}, "
+                f"pitch={self.pitch_target:.3f}, yaw={self.yaw_target:.3f})")
+
+
 class ChestOverAnkleTask(Task):
     r"""Balance task: keep the upper-body CoM projection over the ankle.
 
@@ -264,6 +358,9 @@ class WholeBodyIK:
         chest_head_frame_name: Optional[str] = None,
         chest_hip_frame_name: Optional[str] = None,
         chest_ankle_frame_name: Optional[str] = None,
+        neural_posture_cost: float = 0.0,
+        neural_waist_joint_name: Optional[str] = None,
+        neural_pitch_joint_names: Optional[Sequence[str]] = None,
         max_velocity: np.ndarray | float = 3.0,
         max_acceleration: np.ndarray | float = 100.0,
         config_limit_gain: float = 0.5,
@@ -489,10 +586,55 @@ class WholeBodyIK:
                 fids["head"], fids["hip"], fids["ankle"],
                 cost=chest_over_ankle_cost)
 
+        # EgoPoser trunk-posture prior (soft, LOW cost): track a hallucinated
+        # human trunk pitch and waist yaw (torso_joint_4). Base-invariant (pure
+        # joint-angle function). The PITCH is tracked on ``neural_pitch_joint_names``
+        # -- by default the HIP joint (torso_joint_3) alone, so the target is the
+        # human's chest-over-pelvis flexion applied at the one "upper-vs-lower
+        # body" hinge, leaving the ankle/knee free for the balance task to
+        # counter-rotate (see NeuralPostureTask). Falls back to
+        # ``trunk_lean_joint_names`` (the legacy full lean sum) when the pitch set
+        # is not given. Included only when neural_posture_cost > 0 and the pitch
+        # joints + the waist joint are named. The per-tick target is set via
+        # set_neural_target(); it defaults to (0, 0) = upright, so before the
+        # estimator produces anything the task is a harmless upright regulariser.
+        self.neural_task = None
+        if neural_posture_cost > 0:
+            pitch_joint_names = (neural_pitch_joint_names
+                                 if neural_pitch_joint_names
+                                 else trunk_lean_joint_names)
+            if not pitch_joint_names:
+                raise ValueError(
+                    "neural_posture_cost > 0 requires neural_pitch_joint_names "
+                    "(or trunk_lean_joint_names as a fallback) -- the joint(s) "
+                    "whose angle sum is the tracked trunk pitch."
+                )
+            if not neural_waist_joint_name:
+                raise ValueError(
+                    "neural_posture_cost > 0 requires neural_waist_joint_name "
+                    "(the waist-yaw joint, e.g. torso_joint_4)."
+                )
+            pitch_v, pitch_q = [], []
+            for nm in pitch_joint_names:
+                if not self.model.existJointName(nm):
+                    raise ValueError(f"Neural-prior pitch joint '{nm}' not in model.")
+                jid = self.model.getJointId(nm)
+                pitch_v.append(int(self.model.idx_vs[jid]))
+                pitch_q.append(int(self.model.idx_qs[jid]))
+            if not self.model.existJointName(neural_waist_joint_name):
+                raise ValueError(
+                    f"Neural-prior waist joint '{neural_waist_joint_name}' "
+                    f"not in model.")
+            wjid = self.model.getJointId(neural_waist_joint_name)
+            self.neural_task = NeuralPostureTask(
+                pitch_v, pitch_q,
+                int(self.model.idx_vs[wjid]), int(self.model.idx_qs[wjid]),
+                cost=neural_posture_cost)
+
         self._tasks = [self.head_task, self.left_task, self.right_task,
                        self.posture_task]
         for task in (self.com_task, self.chest_task, self.trunk_task,
-                     self.damping_task, self.low_accel_task):
+                     self.neural_task, self.damping_task, self.low_accel_task):
             if task is not None:
                 self._tasks.append(task)
         self._frames = {
@@ -583,6 +725,18 @@ class WholeBodyIK:
         self.com_task.set_target(np.array([base_xy[0], base_xy[1], com[2]]))
 
     # -- public API ----------------------------------------------------------
+    def set_neural_target(self, pitch: float, yaw: float) -> None:
+        """Update the EgoPoser trunk prior (trunk pitch, waist yaw), in radians.
+
+        No-op if the neural posture task is not active (neural_posture_cost 0).
+        ``pitch`` is the target SUM of the three sagittal lean joints and ``yaw``
+        the target waist-yaw (torso_joint_4) angle. Call once per control tick
+        with the estimator's latest output; leaving it unset keeps the last
+        value (default (0, 0) = upright).
+        """
+        if self.neural_task is not None:
+            self.neural_task.set_target(pitch, yaw)
+
     def frame_pose(self, q_body: np.ndarray, frame_name: str) -> Tuple[np.ndarray, np.ndarray]:
         """(R, p) of a frame at the given body config, in the model world frame.
 

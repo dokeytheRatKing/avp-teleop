@@ -39,6 +39,8 @@ __all__ = [
     "TORSO_JOINTS",
     "TORSO_LEAN_JOINTS",
     "NECK_JOINTS",
+    "NEURAL_WAIST_JOINT",
+    "NEURAL_PITCH_JOINT",
     "HEAD_FRAME_BODY",
     "CHEST_HEAD_FRAME",
     "CHEST_HIP_FRAME",
@@ -50,6 +52,7 @@ __all__ = [
     "finger_specs",
     "WholeBodyIKConfig",
     "PoseFilterConfig",
+    "EgoPoserConfig",
     "UpperBodyConfig",
     "default_config",
 ]
@@ -107,6 +110,22 @@ TORSO_JOINTS: List[str] = [f"astribot_torso_joint_{i}" for i in range(1, 5)]
 # The sagittal lean spine (hip/knee equivalent), a strict prefix of TORSO_JOINTS;
 # torso_joint_4 (the remainder) is the safe waist yaw.
 TORSO_LEAN_JOINTS: List[str] = [f"astribot_torso_joint_{i}" for i in range(1, 4)]
+# The pure waist-yaw joint (remainder of TORSO_JOINTS after the lean spine).
+# The EgoPoser trunk prior maps the operator's spine axial twist onto this DOF
+# (see WholeBodyIKConfig.neural_posture_cost / NeuralPostureTask).
+NEURAL_WAIST_JOINT: str = "astribot_torso_joint_4"
+# The joint the EgoPoser trunk prior tracks its FORWARD-LEAN (pitch) target on.
+# We use the HIP joint (torso_joint_3, top of the sagittal lean spine) ALONE --
+# not the full lean sum theta_1+theta_2+theta_3. torso_joint_3 is the one hinge
+# that pitches the (rigid) upper trunk over the lower limb, so mapping the
+# operator's chest-over-pelvis flexion here is frame-consistent (human spine vs
+# pelvis  <->  robot upper trunk vs thigh) and, crucially, leaves torso_joint_1/2
+# FREE for ChestOverAnkleTask to counter-rotate for balance -- the prior and the
+# balance task then act on near-orthogonal DOFs instead of fighting over the
+# same "trunk-over-ground" angle (see NeuralPostureTask). sim_teleop disables the
+# trunk-upright pitch regulariser while the prior is active so this hip bias is
+# not cancelled back toward a ground-vertical trunk.
+NEURAL_PITCH_JOINT: str = "astribot_torso_joint_3"
 NECK_JOINTS: List[str] = ["astribot_head_joint_1", "astribot_head_joint_2"]
 
 # Robot "head" end-effector frame: the head camera body is the natural analogue
@@ -265,14 +284,27 @@ class WholeBodyIKConfig:
     # oscillate, as it does not dissipate energy). Set either to 0 to disable
     # that task (e.g. to A/B compare smoothness).
     #
-    # NOTE: ``damping_cost`` is the UPPER-BODY (arms + torso + neck) velocity
-    # cost. The DampingTask actually receives a per-DOF *vector* (see
-    # ``damping_costs``): the chassis DOFs get the much larger
-    # ``damping_cost_chassis`` instead, which is what encodes whole-body movement
-    # priority (base moves only as a last resort). So this one task does double
-    # duty: gentle smoothing on the upper body, strong "don't move me" on the
-    # base.
-    damping_cost: float = 1e-1        # cost on |v|, upper body (units: s/rad)
+    # NOTE: ``damping_cost`` is the TORSO + NECK velocity cost (waist yaw + neck;
+    # the lean spine and the arms have their OWN knobs -- ``damping_cost_lean``
+    # and ``damping_cost_arm`` -- so the four tiers can differ). The DampingTask
+    # actually receives a per-DOF *vector* (see ``damping_costs``): the chassis
+    # DOFs get the much larger ``damping_cost_chassis`` instead, which is what
+    # encodes whole-body movement priority (base moves only as a last resort). So
+    # this one task does double duty: smoothing on the upper body, strong
+    # "don't move me" on the base.
+    #
+    # WHY torso/neck > arm (raised 0.1 -> 2.0): with a FLAT upper-body cost, the
+    # least-norm QP spreads a small hand motion across every equally-cheap DOF, so
+    # the torso/neck/waist visibly drift along with the hand ("whole body follows a
+    # tiny wrist wiggle"). Making the arm the cheapest DOF (``damping_cost_arm``,
+    # below) and the torso/neck several times dearer confines small in-reach motions
+    # to the arm; the torso/neck are recruited only when the arm alone cannot do it.
+    damping_cost: float = 1.0         # cost on |v|, torso yaw + neck (units: s/rad)
+    # Arm (both 7-DOF arms) velocity cost. Kept the LOWEST of the upper body so the
+    # QP reaches with the arm first and leaves the torso/neck/base still for small
+    # in-reach hand motions. Raise it toward ``damping_cost`` for a stiffer arm that
+    # shares more work with the torso; lower it for an even more arm-only response.
+    damping_cost_arm: float = 1e-1    # cost on |v| for the 14 arm DOFs (units: s/rad)
     low_accel_cost: float = 1e-1      # cost on |v - v_prev|    (units: s^2/rad)
 
     # --- Whole-body movement priority (per-DOF DampingTask cost on the base) - #
@@ -288,7 +320,15 @@ class WholeBodyIKConfig:
     # chassis joints from BODY_JOINTS. The chassis carries the HIGHEST damping so
     # the base is the last-resort reach DOF; the lean spine no longer sits below it
     # (its anti-tip role moved to trunk_upright_cost, see damping_cost_lean).
-    damping_cost_chassis: float = 20.0   # cost on |v| for chassis x, y, yaw
+    # Raised 20 -> 25: at 20 the base's ~unit Jacobian still made it "cheap" enough
+    # that small in-reach hand motions (and AVP wrist jitter) slid the base around.
+    # 25 (250x the arm's 0.1) keeps it more planted for in-reach targets while still
+    # converging to a far target within the control loop (40+ started to lag a step
+    # target in the self-checks). The bigger lever against "whole body follows a
+    # tiny wrist wiggle" is actually the arm/torso split below (arm cheapest); this
+    # just trims residual base drift. Raise cautiously for a more planted base
+    # (watch far-reach tracking); lower toward 20 for a more eager base.
+    damping_cost_chassis: float = 25.0   # cost on |v| for chassis x, y, yaw
 
     # --- Lowest tier: the sagittal lean spine (torso_joint_1/2/3) ----------- #
     # These three joints are the robot's hip/knee equivalent (see TORSO_JOINTS
@@ -313,7 +353,17 @@ class WholeBodyIKConfig:
     # squat fails to track by 36-58 mm, at 0.1 it tracks to < 3 mm). The
     # trunk-upright task -- not per-joint damping -- is what now stops the trunk
     # from tipping forward, and it does so without penalising the fold.
-    damping_cost_lean: float = 0.1       # cost on |v| for torso_joint_1, 2, 3
+    #
+    # Raised 0.1 -> 1.0 (matches the torso/neck tier): a small in-reach hand motion
+    # was spreading into the lean spine (the trunk visibly leaned along with a tiny
+    # wrist wiggle) because the lean shared the arm's rock-bottom cost. At 1.0 the
+    # lean is only recruited for a SUSTAINED height change (its persistent frame
+    # error outweighs the cost), not a transient reach -- a middle ground, NOT the
+    # old 40 that blocked squats (verified: a deep squat still folds ~1.35 rad and
+    # tracks < 5 mm at 1.0). TRADEOFF: an intentional squat is slightly less eager
+    # (needs a clearer/held low target); lower this toward damping_cost_arm if you
+    # want squats to trigger more readily, raise it for a stiffer trunk.
+    damping_cost_lean: float = 1.0       # cost on |v| for torso_joint_1, 2, 3
 
     # --- Balance (PRIMARY): keep the chest over the ankle in the ground plane - #
     # ChestOverAnkleTask is the primary anti-tip constraint (confirmed on the real
@@ -347,6 +397,43 @@ class WholeBodyIKConfig:
     # the chest-over-ankle task shape the lean freely. Kept LOW (~0.5) so it does
     # not over-constrain the fold.
     trunk_upright_cost: float = 0.5      # cost on trunk pitch (sum of lean angles)
+
+    # --- EgoPoser neural trunk-posture prior (OPTIONAL, OFF by default) ------ #
+    # Cost of the NeuralPostureTask, which tracks a human trunk posture
+    # hallucinated by EgoPoser from the head + hand poses (see the
+    # avp_teleop_upper_body.egoposer subpackage). It biases TWO trunk DOFs
+    # toward the prior: the trunk PITCH -- tracked on the HIP joint alone
+    # (torso_joint_3, see NEURAL_PITCH_JOINT), NOT the full lean sum -- and the
+    # WAIST YAW (torso_joint_4). Kept DELIBERATELY LOW -- well below the balance
+    # (chest_over_ankle_cost=50) and end-effector (arm=10, head=3) costs -- so
+    # the prior only shapes the trunk's null space toward a more natural /
+    # anthropomorphic pose and is mathematically overridden whenever it would
+    # fight balance or hand precision. This realises the "deep learning for
+    # human-likeness, QP math for safety" closed loop: even an aggressive or
+    # transiently unstable hallucinated pose cannot tip the robot, because
+    # ChestOverAnkleTask outweighs it by ~60x.
+    #
+    # WHY THE HIP JOINT, NOT THE LEAN SUM: the sum theta_1+theta_2+theta_3 is the
+    # trunk pitch relative to the GROUND -- the very quantity ChestOverAnkleTask
+    # governs -- so tracking it makes the low-cost prior fight the cost-50 balance
+    # task for the same DOF and get attenuated to near-nothing (little human
+    # posture survives). torso_joint_3 (the hip) is instead the "upper trunk over
+    # lower limb" hinge; tracking the operator's chest-over-pelvis flexion there
+    # is frame-consistent AND leaves torso_joint_1/2 free for balance to
+    # counter-rotate (ankle/knee sit back to keep the chest over the ankle). The
+    # prior and balance then act on near-orthogonal DOFs and both are satisfied:
+    # the robot hinges forward at the hip like a person while staying balanced.
+    #
+    # 0 DISABLES the task entirely (default) -> the solver is byte-for-byte the
+    # non-neural pipeline, with no torch dependency touched. Raise toward (but
+    # keep below) trunk_upright_cost's neighbours for a stronger human bias;
+    # start around 0.8 and tune on hardware. When this is > 0, sim_teleop DISABLES
+    # trunk_upright_cost (its sum->0 pull would force torso_joint_1/2 to cancel
+    # the hip bias back toward a ground-vertical trunk); balance is left entirely
+    # to ChestOverAnkleTask. Requires neural_pitch_joint_names (defaults to the
+    # hip via NEURAL_PITCH_JOINT) + neural_waist_joint_name at build time and a
+    # per-tick WholeBodyIK.set_neural_target(pitch, yaw).
+    neural_posture_cost: float = 0.0     # cost on (trunk pitch, waist yaw) prior error
 
     # --- Balance: keep the CoM over the wheel base (soft constraint) -------- #
     # A ComTask pins the whole-robot centre of mass to a target in the world
@@ -433,22 +520,24 @@ class WholeBodyIKConfig:
         QP move that DOF *less* / *later*. Tiers, cheapest (moves first) to most
         expensive (moves last):
 
-            arms + neck + waist yaw + lean   ``damping_cost`` / ``damping_cost_lean``
-            chassis / mobile base            ``damping_cost_chassis``  (last resort)
+            arms                     ``damping_cost_arm``      (moves first)
+            torso yaw + neck + lean  ``damping_cost`` / ``damping_cost_lean``
+            chassis / mobile base    ``damping_cost_chassis``  (last resort)
 
-        The lean spine (torso_joint_1/2/3) now shares the light upper-body damping
-        (``damping_cost_lean`` defaults to ~``damping_cost``): its ANTI-TIP
-        behaviour is enforced directly by the trunk-upright task (sum of lean
-        angles -> 0), NOT by heavy per-joint damping. Damping it heavily is
-        actively harmful because a genuine squat needs large individual lean moves
-        whose SUM stays 0 (an accordion fold), which heavy per-joint damping would
-        block. The chassis keeps the highest cost so the base stays a last-resort
-        reach DOF.
+        The arm is the CHEAPEST DOF so a small in-reach hand motion is realised by
+        the arm alone; the torso/neck/lean are several times dearer so they stay
+        put unless the arm cannot do the job (this fixes "the whole body follows a
+        tiny wrist wiggle"). The lean spine (torso_joint_1/2/3) shares the
+        torso/neck tier (``damping_cost_lean``); its ANTI-TIP behaviour is enforced
+        by the balance tasks (chest-over-ankle / trunk-upright), NOT by this
+        damping, but a middling cost keeps a transient reach from leaning the trunk
+        while still allowing a SUSTAINED squat. The chassis keeps the highest cost
+        so the base stays a last-resort reach DOF.
         """
         return self._assemble(
             self.damping_cost_chassis, self.damping_cost_chassis,
             self.damping_cost_lean, self.damping_cost,
-            self.damping_cost, self.damping_cost,
+            self.damping_cost, self.damping_cost_arm,
         )
 
 
@@ -470,6 +559,59 @@ class PoseFilterConfig:
     alpha_rotation: float = 0.5
 
 
+def _default_egoposer_weights() -> str:
+    """Absolute path to the bundled EgoPoser checkpoint, or "" if absent.
+
+    Looks for ``egoposer/model_zoo/egoposer.pth`` next to this config module so
+    ``--egoposer`` works out of the box once the weights are downloaded there,
+    regardless of the current working directory.
+    """
+    import os
+
+    path = os.path.join(os.path.dirname(__file__), "egoposer", "model_zoo",
+                        "egoposer.pth")
+    return path if os.path.isfile(path) else ""
+
+
+@dataclass
+class EgoPoserConfig:
+    """EgoPoser neural trunk-posture prior (see the ``egoposer`` subpackage).
+
+    OFF by default (``enabled=False``): the teleop then runs exactly as before
+    with no torch dependency. When enabled, EgoPoser hallucinates the operator's
+    trunk posture from the head + hand poses and the result is fed to the QP as
+    a low-cost :class:`NeuralPostureTask` (see
+    :attr:`WholeBodyIKConfig.neural_posture_cost`) that biases trunk pitch +
+    waist yaw toward a natural human pose while balance / precision dominate.
+
+    ``weights_path`` points at the released EgoPoser checkpoint (a ``.pth`` with
+    a ``"params"`` state_dict); download it from the project's Google Drive (see
+    :attr:`EgoPoserEstimator.WEIGHTS_DRIVE_URL`) or via
+    ``EgoPoserEstimator.download_weights``. If it is missing or torch is not
+    installed the estimator reports itself unavailable and the prior silently
+    stays off, so teleop never breaks.
+
+    ``pitch_gain`` / ``yaw_gain`` scale (and can sign-flip) the SMPL-spine ->
+    robot-trunk mapping; ``max_pitch`` / ``max_yaw`` clamp the target for safety;
+    ``alpha`` EMA-smooths the prior across ticks (1.0 = off). ``window_size`` and
+    ``fps`` must match the trained model (80 @ 60 Hz for the released weights).
+    """
+
+    enabled: bool = False
+    # Default to the checkpoint bundled under egoposer/model_zoo/ (resolved
+    # absolute at construction, see default_config); empty string -> no default.
+    weights_path: str = field(default_factory=lambda: _default_egoposer_weights())
+    window_size: int = 80
+    fps: float = 60.0
+    spatial_normalization: bool = True
+    device: str = "cpu"
+    pitch_gain: float = 1.0
+    yaw_gain: float = 1.0
+    max_pitch: float = 1.2
+    max_yaw: float = 1.0
+    alpha: float = 0.5          # EMA smoothing of the (pitch, yaw) prior in (0, 1]
+
+
 @dataclass
 class UpperBodyConfig:
     """Top-level config for the upper-body teleop pipeline."""
@@ -483,6 +625,8 @@ class UpperBodyConfig:
     retarget: RetargetConfig = field(default_factory=RetargetConfig)
     # Smoothing of the AVP target poses (head + both hands) before the solver.
     filter: PoseFilterConfig = field(default_factory=PoseFilterConfig)
+    # EgoPoser neural trunk-posture prior (opt-in; see EgoPoserConfig).
+    egoposer: EgoPoserConfig = field(default_factory=EgoPoserConfig)
 
     # Head-specific mapping knobs (the arms use retarget.position_scale /
     # retarget.track_orientation).

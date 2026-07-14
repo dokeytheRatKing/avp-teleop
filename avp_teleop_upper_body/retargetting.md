@@ -162,6 +162,7 @@ Pinocchio 的 MJCF 解析器会把底盘 3 个连续关节**合并成一个** `J
 | 7 | ComTask（水平） | 遗留质量平衡 | **0.0（关闭）** | 老式基于质量的 CoM 平衡，已被 5/6 取代，默认关闭 |
 | 8 | DampingTask | 软平滑 + 优先级 | 逐-DOF：上身 **0.1** / 底盘 **20** | 罚 |v|：既平滑上身，又编码"底盘最后动"的全身优先级 |
 | 9 | LowAccelerationTask | 软平滑 | **0.1** | 罚帧间加速度，降 jerk |
+| 10 † | **NeuralPostureTask** | 软先验（可选） | **0.0（关闭）→ 0.8** | EgoPoser 幻想的人类躯干姿态：把躯干俯仰（前倾脊柱角度和）+ 腰部偏航软拉向先验值；代价极低，平衡/精度永远压过它。见 §3.4 |
 
 此外还有**硬约束**（不在任务列表，而是 QP 不等式）：
 - **VelocityLimit**（速度限位）
@@ -197,13 +198,55 @@ Pinocchio 的 MJCF 解析器会把底盘 3 个连续关节**合并成一个** `J
 
 因为 `ChestOverAnkleTask` 用到 `head_joint_1`，当**目标位姿本身不平衡**时，它会与头相机 FrameTracking 竞争——这是**正确的**（平衡 vs 指向的权衡）。所以 selfcheck 测试必须用**平衡的目标**（前倾脊柱=0，运动放在腰部偏航），否则头部跟踪会正确地退化约 6 mm。
 
+### 3.4 EgoPoser 神经躯干先验（可选，默认关闭）
+
+**动机**：QP 只跟踪头 + 双手三个末端，躯干/腰只由 `PostureTask`（拉向 home 直立）和平衡任务约束——所以机器人躯干姿态是"够用但不够拟人"的。[EgoPoser](https://github.com/eth-siplab/EgoPoser)（Jiang et al., ECCV 2024）能**仅凭头 + 双手位姿**幻想出人体全身姿态，我们提取其躯干先验作为 QP 的动态参考姿态，提升遥操作的自然度/拟人性。
+
+**网络与 I/O**（`avp_teleop_upper_body/egoposer/`，`torch` 惰性导入，仅启用时才加载）：
+- `AvatarNet`：3 层 `TransformerEncoder` + SlowFast 融合，embed 256，8 头。**从零重写**（上游仓库无 LICENSE），但 `state_dict` 键与上游 **48/48 完全一致**，官方权重可 `strict=True` 直接加载。
+- 输入：80 帧 @60Hz 滑动窗口，每帧 54 维 = 头/左/右三传感器的 [全局 6D 旋转 + 6D 旋转速度 + 3D 位置 + 3D 位置增量]（`forward` 内再追加 6 维时序增量 → 60）。`FeatureWindow`（`feature_builder.py`）维护环形缓冲，暖机期用首帧补齐。坐标系 Z-up、米，AMASS/SMPL 约定，关节 15/20/21 = 头/左腕/右腕。
+- 输出：`root_orient`（6D 骨盆）+ `pose_body`（126 = 21 个 SMPL 关节 × 6D **局部**旋转）。
+- 单次推理 CPU **~3 ms（p95 3.3 ms）**，远在 60Hz（16.7 ms）预算内。
+
+**重定向（SMPL 脊柱 → 机器人躯干）**（`estimator.py::_retarget`）：
+- 躯干先验**只需前向推理，不需要 SMPL body model / betas / `human_body_prior`**——因为它只用 `pose_body` 的**局部**关节旋转（body model 只用于算关节 3D 位置，我们不需要）。这也天然继承了 EgoPoser 的"全局运动解耦"：先验与操作者全局朝向/位置无关。
+- 取 spine1/2/3（SMPL 关节 3/6/9）局部旋转，复合成胸-relative-骨盆的旋转 `R_chest = R_s1·R_s2·R_s3`，分解内旋欧拉角：**flexion（绕 X）→ 机器人躯干俯仰**（映到前倾脊柱角度和 θ₁+θ₂+θ₃），**twist（绕 Y）→ 腰部偏航**（torso_joint_4）。
+- SMPL 三关节分布式屈曲 ≠ 机器人三平行铰链，故用 `pitch_gain`/`yaw_gain`（含符号）缩放 + `max_pitch`/`max_yaw` 钳位，逐 tick EMA 平滑。
+
+**注入 QP（`NeuralPostureTask`，`whole_body_ik.py`）**：
+- 误差为 2 维：`[Σθ_lean − pitch_target, θ_waist − yaw_target]`，常数雅可比，**与底盘无关**（不会引起底盘漂移）。
+- 代价**刻意压低（0.8）**，远低于平衡（50）和末端跟踪（10/3）——这就是"**用深度学习提升拟人性，用 QP 数学兜底安全**"的闭环：即便网络偶尔输出激进/失稳姿态，`ChestOverAnkleTask` 也以约 60× 的权重把它压住。
+- 目标 `(0, 0)` 恰为"直立"，与 `TrunkUprightTask` 兼容；`neural_posture_cost=0` 时任务**根本不构建**，默认遥操作路径与之前**逐字节一致**、不触碰 torch。
+
+**用法**：
+```bash
+# 一次性下载权重到 egoposer/model_zoo/（或手动从 Google Drive 取，见 WEIGHTS_DRIVE_URL）
+python -c "from avp_teleop_upper_body.egoposer import EgoPoserEstimator; \
+           EgoPoserEstimator.download_weights('avp_teleop_upper_body/egoposer/model_zoo')"
+# 启用先验（权重在 model_zoo/egoposer.pth 时 config 自动设为默认路径，故 --egoposer 单独即可）
+python -m avp_teleop_upper_body.sim_teleop --egoposer
+# 可视化先验：MuJoCo 里画出 EgoPoser 幻想的 SMPL 骨架（青色 capsule 脊柱 + 橙色关节球），
+# 竖直锚定在机器人髋部(torso_joint_3)随腰偏航一起转；默认灰色简化渲染 + 机器人半透明
+python -m avp_teleop_upper_body.sim_teleop --visualize-prior
+python -m avp_teleop_upper_body.sim_teleop --visualize-prior --body-alpha 0.2  # 更透
+python -m avp_teleop_upper_body.sim_teleop --rich-render                       # 恢复完整贴图/阴影
+```
+官方 5 个权重（`egoposer/handtracking/30fps/*_large`）均以 `strict=True` 加载进重写网络（键 48/48 一致，self-check 已验证）。`--visualize-prior` 的骨架由 `pose_body` 局部旋转经名义 SMPL 骨长做正运动学（`estimator._skeleton`）得到，**仅供可视化**、不参与重定向数学。**锚定要点**：SMPL 骨架是世界系构建的（+Z 向上、前倾朝机器人 −Y 面），故必须锚在**竖直、随腰偏航对齐**的框架里、锚点取**髋关节 `torso_joint_3`**（`torso_joint_1/2/3` = 踝/膝/髋，髋≈人体骨盆）；早先误用踝关节 + 躯干 link 的 body 姿态（其 xmat 旋转了 90°，局部 +Z 指向世界 +X）导致脊柱**水平往前方喷出**的 bug。渲染侧默认剥离贴图/阴影/天空盒并压平成灰（省开销），`--body-alpha` 调机器人透明度，`--rich-render` 关闭简化渲染。
+若 torch 或权重缺失，估计器自报 unavailable，先验静默关闭，遥操作不受影响。
+
 ---
 
 ## 四、验证状态
 
-离线 `selfcheck` **11/11 通过**。`check_balance` 从三方面断言胸-踝偏移（主平衡）：
+离线 `selfcheck` **12/12 通过**。`check_balance` 从三方面断言胸-踝偏移（主平衡）：
 - (a) 普通伸手时胸部离踝 < 8 cm（≈0）；
 - (b) 真下蹲折叠约 1.38 rad 时跟踪 < 5 mm 且胸部仍≈0 离踝；
 - (c) **无输入回归守卫**：1500 tick 固定目标 → 底盘漂移 0.0 cm（守护 base-drift bug）。
 
-运行：`conda activate AVP` → `python -m avp_teleop_upper_body.sim_teleop`（另开 `avp_publisher --avp-ip <IP>`），按 `c` 标定头 + 双手，`space` 暂停。
+`check_egoposer_prior` 断言 EgoPoser 先验的四条性质：
+- (a) **关闭=无操作**：`neural_posture_cost=0` 时解与非神经管线**逐字节一致**（回归守卫）；
+- (b) **偏置**：适度先验把躯干俯仰拉向目标（−0.01→0.20 rad）而手部跟踪仍 <2 cm；
+- (c) **安全压制**：激进先验（pitch 1.2）被**衰减到不足一半**（→0.56 rad）且胸部仍 0.0 cm 在踝上方（平衡压过先验）；
+- (d) **管线**：特征窗口 (1,80,54) 有限、6D 旋转往返、torch 在场时随机权重网络端到端跑通。
+
+运行：`conda activate AVP` → `python -m avp_teleop_upper_body.sim_teleop`（另开 `avp_publisher --avp-ip <IP>`），按 `c` 标定头 + 双手，`space` 暂停。启用 EgoPoser 先验加 `--egoposer`（见 §3.4）。

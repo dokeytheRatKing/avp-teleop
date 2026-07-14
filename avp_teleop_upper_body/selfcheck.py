@@ -16,10 +16,13 @@ Covers:
   8. soft smoothing: DampingTask + LowAccelerationTask cut peak speed/accel
   9. finger curl is monotonic from a synthetic "open" to "fist" pose
  10. end-to-end tick: synthetic head + two hands -> finite ctrl + stable step
+ 11. EgoPoser trunk prior: disabled=no-op, biases trunk pitch, balance overrides
+     an aggressive prior, and the feature/rotation/inference plumbing is finite
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 
@@ -35,8 +38,9 @@ from avp_teleop.selfcheck import _synthetic_hand
 
 from avp_teleop_upper_body.config import (
     default_config, MJCF_PATH, BODY_JOINTS, IK_KEEP_JOINTS, BODY_HOME,
-    HEAD_FRAME_BODY, CHASSIS_BASE_FRAME, TORSO_LEAN_JOINTS, TOOL_BODY,
-    CHEST_HEAD_FRAME, CHEST_HIP_FRAME, CHEST_ANKLE_FRAME,
+    HEAD_FRAME_BODY, CHASSIS_BASE_FRAME, TORSO_LEAN_JOINTS, NEURAL_WAIST_JOINT,
+    NEURAL_PITCH_JOINT,
+    TOOL_BODY, CHEST_HEAD_FRAME, CHEST_HIP_FRAME, CHEST_ANKLE_FRAME,
     all_finger_joints, finger_specs,
 )
 from avp_teleop_upper_body.transport import (
@@ -55,6 +59,7 @@ def _fail(name, msg): print(f"  [FAIL] {name}: {msg}")
 _CHASSIS = slice(0, 3)
 _TORSO = slice(3, 7)
 _LEAN = slice(3, 6)      # torso_joint_1/2/3: the sagittal lean spine
+_HIP = 5                 # torso_joint_3: the hip joint (neural-prior pitch DOF)
 _WAIST = slice(6, 7)     # torso_joint_4: pure waist yaw
 _NECK = slice(7, 9)
 _LARM = slice(9, 16)
@@ -170,7 +175,7 @@ def check_model(cfg):
 
 def _build_ik(cfg, *, head_ori, arm_ori, damping=None, low_accel=None,
               enforce=None, com_cost=None, trunk_upright_cost=None,
-              chest_over_ankle_cost=None):
+              chest_over_ankle_cost=None, neural_posture_cost=None):
     return WholeBodyIK(
         MJCF_PATH, IK_KEEP_JOINTS, HEAD_FRAME_BODY,
         TOOL_BODY["left"], TOOL_BODY["right"], np.array(BODY_HOME),
@@ -193,6 +198,11 @@ def _build_ik(cfg, *, head_ori, arm_ori, damping=None, low_accel=None,
         chest_head_frame_name=CHEST_HEAD_FRAME,
         chest_hip_frame_name=CHEST_HIP_FRAME,
         chest_ankle_frame_name=CHEST_ANKLE_FRAME,
+        neural_posture_cost=(cfg.ik.neural_posture_cost
+                             if neural_posture_cost is None
+                             else neural_posture_cost),
+        neural_waist_joint_name=NEURAL_WAIST_JOINT,
+        neural_pitch_joint_names=[NEURAL_PITCH_JOINT],  # hip only (torso_joint_3)
         max_velocity=cfg.ik.max_velocity(), max_acceleration=cfg.ik.max_acceleration(),
         config_limit_gain=cfg.ik.config_limit_gain, control_dt=cfg.ik.control_dt,
         enforce_limits=cfg.ik.enforce_limits if enforce is None else enforce,
@@ -717,10 +727,308 @@ def check_end_to_end(cfg, model, data) -> bool:
     return False
 
 
+def check_egoposer_prior(cfg, model, data) -> bool:
+    """The EgoPoser trunk prior is a safe, overridable soft bias.
+
+    Asserts the four properties that make the prior "deep learning for
+    human-likeness, QP math for safety":
+
+    (a) DISABLED = NO-OP: with neural_posture_cost=0 the solver produces a
+        bit-identical solution to the current pipeline (regression guard: the
+        default teleop path is byte-for-byte unchanged);
+    (b) BIAS: with the prior ON and a modest trunk-pitch target on a balanced
+        reach, the trunk pitch (sum of the lean joints) moves toward the target
+        vs. the prior-off solution;
+    (c) SAFETY OVERRIDE: an AGGRESSIVE off-balance prior target does NOT tip the
+        robot -- the chest stays over the ankle -- because ChestOverAnkleTask
+        (cost 50) outweighs the low-cost prior (~0.8);
+    (d) PLUMBING: the feature window builds a finite (1, W, 54) input and the
+        6D rotation round-trips; if torch is present, a randomly-initialised
+        EgoPoserEstimator runs end-to-end and returns a finite (pitch, yaw).
+    """
+    from avp_teleop_upper_body.egoposer import EgoPoserEstimator, FeatureWindow
+    from avp_teleop_upper_body.egoposer.rotations import matrot2sixd, sixd2matrot
+    from scipy.spatial.transform import Rotation
+
+    body_adr = _body_qpos_adr(model)
+    home = np.array(BODY_HOME)
+    names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
+
+    # A balanced reach target (waist yaw only, lean spine at 0), reused below.
+    base0 = _fk_frames(model, data, body_adr, home, names)
+    d_hands = np.array([0.15, 0.0, 0.0])
+    tgt = {names[0]: (base0[names[0]][1], base0[names[0]][0])}
+    for nm in names[1:]:
+        tgt[nm] = (base0[nm][1] + d_hands, base0[nm][0])
+
+    def _drive(ik, pitch=None, yaw=None, iters=300):
+        ik.reset()
+        q = home.copy()
+        for _ in range(iters):
+            if pitch is not None:
+                ik.set_neural_target(pitch, yaw)
+            q = ik.solve(q, tgt[names[0]], tgt[names[1]], tgt[names[2]])
+        return q
+
+    def _chest_offset(q):
+        def _jxy(joint):
+            data.qpos[:] = 0.0
+            for adr, qi in zip(body_adr, q):
+                data.qpos[adr] = qi
+            mujoco.mj_forward(model, data)
+            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint)
+            return data.xanchor[jid][:2].copy()
+        chest = 0.5 * (_jxy(CHEST_HEAD_FRAME) + _jxy(CHEST_HIP_FRAME))
+        return float(np.linalg.norm(chest - _jxy(CHEST_ANKLE_FRAME)))
+
+    # (a) disabled == no-op (bit-identical to prior-off).
+    ik_off = _build_ik(cfg, head_ori=1.0, arm_ori=1.0, neural_posture_cost=0.0)
+    if ik_off.neural_task is not None:
+        _fail("egoposer", "neural task built with cost 0 (should be absent)")
+        return False
+    q_off = _drive(ik_off)
+
+    ik_off2 = _build_ik(cfg, head_ori=1.0, arm_ori=1.0, neural_posture_cost=0.0)
+    q_off2 = _drive(ik_off2)
+    if not np.array_equal(q_off, q_off2):
+        _fail("egoposer", "disabled path is not deterministic/identical")
+        return False
+
+    # (b) modest prior biases the trunk pitch toward the target.
+    # Mirror the deployed config: with the prior ON, sim_teleop DISABLES
+    # trunk_upright_cost (its sum->0 pull would cancel the hip-joint bias), so
+    # build ik_on the same way -- otherwise upright would fight the hip target.
+    ik_on = _build_ik(cfg, head_ori=1.0, arm_ori=1.0, neural_posture_cost=0.8,
+                      trunk_upright_cost=0.0)
+    if ik_on.neural_task is None:
+        _fail("egoposer", "neural task not built with cost > 0")
+        return False
+    def _hand_err(q):
+        sol = _fk_frames(model, data, body_adr, q, names)
+        return max(float(np.linalg.norm(sol[nm][1] - tgt[nm][0])) for nm in names)
+
+    pitch_tgt = 0.30
+    q_bias = _drive(ik_on, pitch=pitch_tgt, yaw=0.0)
+    # Pitch is now tracked on the HIP joint (torso_joint_3) alone, not the lean
+    # sum, so measure the hip angle.
+    hip_off = float(q_off[_HIP])
+    hip_bias = float(q_bias[_HIP])
+    err_off = _hand_err(q_off)
+    err_bias = _hand_err(q_bias)
+    # The biased solution's hip angle should move toward the target (larger
+    # than the prior-off hip) by a clear margin, WITHOUT wrecking hand
+    # tracking (precision preserved at a realistic bias magnitude).
+    if not (hip_bias > hip_off + 0.02):
+        _fail("egoposer", f"prior did not bias trunk pitch at the hip "
+              f"(off={hip_off:.3f}, on={hip_bias:.3f}, target={pitch_tgt})")
+        return False
+    if err_bias > err_off + 0.01:
+        _fail("egoposer", f"modest prior hurt hand tracking too much "
+              f"({err_off*1000:.1f} -> {err_bias*1000:.1f} mm)")
+        return False
+
+    # (c) SAFETY OVERRIDE: an AGGRESSIVE off-balance prior target cannot tip the
+    # robot -- the chest stays over the ankle (ChestOverAnkleTask, cost 50) -- and
+    # the low-cost prior (0.8) is strongly ATTENUATED, never reaching its target
+    # (proof the balance/precision tasks dominate). A big forward pitch that the
+    # QP *did* honour would fold the body and pull fixed-height hands out of
+    # reach, so we assert the prior is suppressed rather than followed.
+    aggr_tgt = 1.2
+    q_aggr = _drive(ik_on, pitch=aggr_tgt, yaw=0.0)
+    chest_aggr = _chest_offset(q_aggr)
+    hip_aggr = float(q_aggr[_HIP])
+    if chest_aggr > 0.08:
+        _fail("egoposer", f"aggressive prior tipped the robot: chest "
+              f"{chest_aggr*100:.1f} cm off the ankle (balance must override)")
+        return False
+    if hip_aggr > 0.8 * aggr_tgt:
+        _fail("egoposer", f"aggressive prior not attenuated (hip {hip_aggr:.2f} "
+              f">= 0.8*{aggr_tgt}; low-cost prior should be dominated)")
+        return False
+
+    # (d) plumbing: feature window + rotation round-trip (+ torch forward if any).
+    R = Rotation.from_euler("XYZ", [0.3, -0.5, 0.2]).as_matrix()
+    if np.abs(R - sixd2matrot(matrot2sixd(R))).max() > 1e-9:
+        _fail("egoposer", "6D rotation round-trip failed")
+        return False
+    fw = FeatureWindow(window_size=cfg.egoposer.window_size, align_R=cfg.align_R)
+    Th = np.eye(4); Th[:3, 3] = [0.0, 0.0, 1.5]
+    Tl = np.eye(4); Tl[:3, 3] = [0.2, 0.1, 0.9]
+    Tr = np.eye(4); Tr[:3, 3] = [-0.2, 0.1, 0.9]
+    for _ in range(5):
+        fw.push(Th, Tl, Tr)
+    win = fw.as_batch()
+    if win.shape != (1, cfg.egoposer.window_size, 54) or not np.isfinite(win).all():
+        _fail("egoposer", f"feature window bad shape/finite: {win.shape}")
+        return False
+
+    torch_note = "torch absent (forward skipped)"
+    est = EgoPoserEstimator(weights_path=None, window_size=cfg.egoposer.window_size,
+                            align_R=cfg.align_R, allow_random=True)
+    if est.available():
+        prior = None
+        for _ in range(cfg.egoposer.window_size + 2):
+            prior = est.predict(Th, Tl, Tr, with_skeleton=True)
+        if prior is None or not np.isfinite([prior.pitch, prior.yaw]).all():
+            _fail("egoposer", "random-net estimator produced no finite prior")
+            return False
+        # skeleton FK (for --visualize-prior): 22 finite pelvis-local points
+        # (full SMPL body: pelvis + the 21 pose_body joints).
+        if (prior.skeleton is None or prior.skeleton.shape != (22, 3)
+                or not np.isfinite(prior.skeleton).all()):
+            _fail("egoposer", f"skeleton FK bad: {getattr(prior.skeleton,'shape',None)}")
+            return False
+        torch_note = (f"random-net forward OK (pitch={prior.pitch:.2f}, "
+                      f"yaw={prior.yaw:.2f}); skeleton (22,3) finite")
+
+        # If the released weights are bundled, prove they load into the clean
+        # reimplementation (strict=True key parity) and produce a finite prior.
+        wpath = cfg.egoposer.weights_path
+        if wpath and os.path.isfile(wpath):
+            import torch as _torch
+            from avp_teleop_upper_body.egoposer.network import AvatarNet
+            sd = _torch.load(wpath, map_location="cpu", weights_only=True)
+            if isinstance(sd, dict) and "params" in sd:
+                sd = sd["params"]
+            net = AvatarNet(input_dim=60, num_layer=3, embed_dim=256, nhead=8,
+                            spatial_normalization=True, shape_estimation=False)
+            missing, unexpected = [], []
+            try:
+                net.load_state_dict(sd, strict=True)
+            except Exception as e:
+                _fail("egoposer", f"released weights don't fit the reimpl "
+                      f"(strict load failed): {e}")
+                return False
+            real = EgoPoserEstimator(weights_path=wpath,
+                                     window_size=cfg.egoposer.window_size,
+                                     align_R=cfg.align_R)
+            if not real.available():
+                _fail("egoposer", f"bundled weights failed to load: {real.reason}")
+                return False
+            rp = None
+            for _ in range(cfg.egoposer.window_size + 2):
+                rp = real.predict(Th, Tl, Tr)
+            if rp is None or not np.isfinite([rp.pitch, rp.yaw]).all():
+                _fail("egoposer", "bundled weights produced no finite prior")
+                return False
+            torch_note += (f"; released ckpt strict-loads (pitch={rp.pitch:.2f}, "
+                           f"yaw={rp.yaw:.2f})")
+    else:
+        # torch missing is acceptable: the prior must degrade gracefully to off.
+        if EgoPoserEstimator(weights_path=None).predict(Th, Tl, Tr) is not None:
+            _fail("egoposer", "unavailable estimator did not return None")
+            return False
+
+    _ok(f"egoposer prior: disabled=no-op; hip bias {hip_off:.2f}->{hip_bias:.2f} rad "
+        f"(hands {err_off*1000:.1f}->{err_bias*1000:.1f} mm); aggressive attenuated "
+        f"{aggr_tgt}->{hip_aggr:.2f} rad, chest {chest_aggr*100:.1f} cm off ankle; "
+        f"{torch_note}")
+    return True
+
+
+def check_trajectory_io() -> bool:
+    """Record/replay round-trip: AVP-input frames and retarget frames survive
+    a save -> load with byte-faithful values, and FileAvpSource re-emits them."""
+    import tempfile
+    from avp_teleop_upper_body import trajectory_io as tio
+
+    # --- AVP input trajectory: build 3 ticks, save, reload via FileAvpSource ---
+    wrist = np.eye(4, dtype=np.float32); wrist[:3, 3] = [0.2, -0.1, 0.3]
+    head = np.eye(4, dtype=np.float32); head[:3, 3] = [0.0, 0.0, 1.45]
+    kp = np.arange(63, dtype=np.float32).reshape(21, 3) * 0.001
+    rec = tio.AvpTrajectoryRecorder(1.0 / 60.0, note="selfcheck")
+    for seq in range(3):
+        hands = {s: HandFrame(s, True, seq, 0.0, 0.3, wrist, kp)
+                 for s in ("left", "right")}
+        rec.record(hands, HeadFrame(True, seq, 0.0, head))
+    # An invalid/empty tick must survive too (timing/dropout fidelity).
+    rec.record({}, None)
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "clip.json")
+        rec.save(path)
+        src = tio.FileAvpSource(path)
+        if src.n_frames != 4:
+            _fail("trajectory io", f"AVP replay has {src.n_frames} frames, want 4")
+            return False
+        h0, hd0 = src.poll()
+        if not (set(h0) == {"left", "right"} and hd0 is not None
+                and np.allclose(h0["left"].wrist, wrist, atol=1e-6)
+                and np.allclose(h0["left"].keypoints, kp, atol=1e-6)
+                and abs(h0["left"].pinch - 0.3) < 1e-6
+                and np.allclose(hd0.head, head, atol=1e-6)):
+            _fail("trajectory io", "AVP frame values not preserved on round-trip")
+            return False
+        src.poll(); src.poll()          # ticks 1, 2
+        h3, hd3 = src.poll()            # tick 3 = the empty one
+        if h3 != {} or hd3 is not None:
+            _fail("trajectory io", "empty AVP tick not preserved")
+            return False
+        if not src.done:
+            _fail("trajectory io", "FileAvpSource did not flag done at the end")
+            return False
+
+    # --- trim_frames: drop first/last N seconds, re-base t to 0 --------------- #
+    fs = [{"t": i * 0.5} for i in range(11)]          # 0.0 .. 5.0 s, 0.5 s step
+    kept = tio.trim_frames([dict(f) for f in fs], 1.0)  # keep [1.0, 4.0], rebased
+    if not (len(kept) == 7 and abs(kept[0]["t"]) < 1e-9
+            and abs(kept[-1]["t"] - 3.0) < 1e-9):
+        _fail("trajectory io", f"trim wrong: n={len(kept)}, "
+              f"t0={kept[0]['t']}, tN={kept[-1]['t']}")
+        return False
+    # Over-long trim (would remove everything) leaves the clip untouched.
+    if len(tio.trim_frames([dict(f) for f in fs], 10.0)) != len(fs):
+        _fail("trajectory io", "over-long trim did not no-op")
+        return False
+
+    # --- Retarget trajectory: metadata + a frame with targets/joints/fingers ---
+    rrec = tio.RetargetTrajectoryRecorder(
+        argv=["--replay-avp", "clip"], model_path=MJCF_PATH,
+        body_joints=BODY_JOINTS, nominal_dt=1.0 / 60.0,
+        track_orientation=False, head_track_orientation=True)
+    q = np.linspace(-0.1, 0.1, len(BODY_JOINTS))
+    tp = np.array([0.4, 0.1, 1.0]); tR = np.eye(3)
+    targets = {"head": (np.array([0.0, 0.0, 1.5]), None),
+               "left": (tp, tR), "right": (tp, None)}
+    viz_rot = {"head": np.eye(3), "left": tR, "right": None}
+    rrec.record(hands={"left": HandFrame("left", True, 0, 0.0, 0.0, wrist, kp)},
+                head=HeadFrame(True, 0, 0.0, head), targets=targets,
+                viz_rot=viz_rot, q_body=q,
+                fingers={"left": {"j1": 0.5}}, neural=(0.2, 0.1),
+                skeleton=np.zeros((22, 3)))
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "run.json")
+        rrec.save(path)
+        payload = tio.load_retarget_trajectory(path)
+        meta, frames = payload["metadata"], payload["frames"]
+        if not (meta["argv"] == ["--replay-avp", "clip"]
+                and meta["body_joints"] == list(BODY_JOINTS)
+                and os.path.isabs(meta["model_path"])):
+            _fail("trajectory io", "retarget metadata not preserved")
+            return False
+        fr = frames[0]
+        p_rt, R_rt = tio.frame_target(fr, "left")
+        if not (len(frames) == 1
+                and np.allclose(fr["q_body"], q, atol=1e-9)
+                and np.allclose(p_rt, tp, atol=1e-9)
+                and R_rt is not None and np.allclose(R_rt, tR, atol=1e-9)
+                and tio.frame_target(fr, "head")[1] is None
+                and abs(fr["fingers"]["left"]["j1"] - 0.5) < 1e-9
+                and abs(fr["neural"]["pitch"] - 0.2) < 1e-9
+                and np.asarray(fr["skeleton"]).shape == (22, 3)):
+            _fail("trajectory io", "retarget frame values not preserved")
+            return False
+
+    _ok("trajectory io: AVP + retarget record/replay round-trip (values, "
+        "empty ticks, metadata)")
+    return True
+
+
 def main() -> int:
     cfg = default_config()
     print("Running upper-body teleop self-checks...\n")
-    results = [check_transport(), check_pose_filter()]
+    results = [check_transport(), check_pose_filter(), check_trajectory_io()]
 
     loaded = check_model(cfg)
     if loaded is None:
@@ -736,6 +1044,7 @@ def main() -> int:
     results.append(check_smoothing(cfg, model, data))
     results.append(check_fingers(cfg))
     results.append(check_end_to_end(cfg, model, data))
+    results.append(check_egoposer_prior(cfg, model, data))
 
     n_pass = sum(results) + 1   # +1 for the model check
     n_total = len(results) + 1

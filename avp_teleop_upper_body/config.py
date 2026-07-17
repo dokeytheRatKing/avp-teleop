@@ -45,6 +45,7 @@ __all__ = [
     "CHEST_HEAD_FRAME",
     "CHEST_HIP_FRAME",
     "CHEST_ANKLE_FRAME",
+    "WAIST_LINK_BODY",
     "BODY_JOINTS",
     "IK_KEEP_JOINTS",
     "BODY_HOME",
@@ -142,6 +143,10 @@ HEAD_FRAME_BODY: str = "astribot_head_camera_base_link"
 CHEST_HEAD_FRAME: str = "astribot_head_joint_1"    # top of the chest segment
 CHEST_HIP_FRAME: str = "astribot_torso_joint_3"    # hip (top of the lean spine)
 CHEST_ANKLE_FRAME: str = "astribot_torso_joint_1"  # ankle (base of the lean spine)
+# Waist link (shared root of both arms + head); its local +X is the robot's
+# forward heading (world -Y at neutral). Used by the Phase-3 hand-in-front guard
+# for the "front" direction, and by the EgoPoser prior anchor in sim_teleop.
+WAIST_LINK_BODY: str = "astribot_torso_link_4"
 
 # The 23 actuated DOFs solved as one body, in a FIXED order used everywhere on
 # the *command* side (IK output vector, SimRobot.command_arm, BODY_HOME, the
@@ -255,8 +260,8 @@ class WholeBodyIKConfig:
     # its x/y DOFs are PRISMATIC (metres -> m/s, m/s^2) while zrot is REVOLUTE
     # (rad/s, rad/s^2). pink.limits apply each cap per tangent DOF regardless of
     # unit, so metric and angular caps coexist in one limit.
-    chassis_max_linear_velocity: float = 0.6   # m/s    (base translation x, y)
-    chassis_max_yaw_velocity: float = 1.2      # rad/s  (base yaw)
+    chassis_max_linear_velocity: float = 1.2   # m/s    (base translation x, y) 0.6
+    chassis_max_yaw_velocity: float = 1     # rad/s  (base yaw) 1.2
     torso_neck_max_velocity: float = 1.8       # rad/s  (~ old 0.03 rad/tick @60Hz)
     arm_max_velocity: float = 3.0              # rad/s  (~ old 0.05 rad/tick @60Hz)
     chassis_max_linear_acceleration: float = 4.0   # m/s^2
@@ -284,11 +289,12 @@ class WholeBodyIKConfig:
     # oscillate, as it does not dissipate energy). Set either to 0 to disable
     # that task (e.g. to A/B compare smoothness).
     #
-    # NOTE: ``damping_cost`` is the TORSO + NECK velocity cost (waist yaw + neck;
-    # the lean spine and the arms have their OWN knobs -- ``damping_cost_lean``
-    # and ``damping_cost_arm`` -- so the four tiers can differ). The DampingTask
+    # NOTE: ``damping_cost`` is now the NECK-only velocity cost; the waist yaw, the
+    # lean spine and the arms have their OWN knobs -- ``damping_cost_waist``,
+    # ``damping_cost_lean`` and ``damping_cost_arm`` -- so the five tiers can differ.
+    # The DampingTask
     # actually receives a per-DOF *vector* (see ``damping_costs``): the chassis
-    # DOFs get the much larger ``damping_cost_chassis`` instead, which is what
+    # DOFs get the much larger ``damping_cost_chassis_{linear,yaw}`` instead, which is what
     # encodes whole-body movement priority (base moves only as a last resort). So
     # this one task does double duty: smoothing on the upper body, strong
     # "don't move me" on the base.
@@ -299,7 +305,18 @@ class WholeBodyIKConfig:
     # tiny wrist wiggle"). Making the arm the cheapest DOF (``damping_cost_arm``,
     # below) and the torso/neck several times dearer confines small in-reach motions
     # to the arm; the torso/neck are recruited only when the arm alone cannot do it.
-    damping_cost: float = 1.0         # cost on |v|, torso yaw + neck (units: s/rad)
+    damping_cost: float = 1.0         # cost on |v|, NECK only (units: s/rad)
+    # Waist yaw (torso_joint_4) velocity cost. SPLIT OUT of ``damping_cost`` (which
+    # now covers only the neck) so the safe waist yaw can be priced independently of
+    # the neck. The waist shifts NO CoM and changes NO height (unlike the lean spine),
+    # so it is safe to move freely: LOWER this (toward ``damping_cost_arm``) to make
+    # the QP rotate the WAIST rather than contort the ARMS on an in-place torso twist
+    # (json7/8) -- a reactive-priority fix, NOT a competing target task like the old
+    # Phase-2b WaistYawTask. RAISE it toward ``damping_cost`` for a stiffer waist that
+    # leaves twisting to the arms. Tuned to 0.5 (from 1.0) after real-robot
+    # testing: a lower waist cost turns the waist rather than contorting the arms
+    # on an in-place twist, which felt better to the operator.
+    damping_cost_waist: float = 0.5   # cost on |v| for torso_joint_4 (waist yaw)
     # Arm (both 7-DOF arms) velocity cost. Kept the LOWEST of the upper body so the
     # QP reaches with the arm first and leaves the torso/neck/base still for small
     # in-reach hand motions. Raise it toward ``damping_cost`` for a stiffer arm that
@@ -328,7 +345,219 @@ class WholeBodyIKConfig:
     # tiny wrist wiggle" is actually the arm/torso split below (arm cheapest); this
     # just trims residual base drift. Raise cautiously for a more planted base
     # (watch far-reach tracking); lower toward 20 for a more eager base.
-    damping_cost_chassis: float = 25.0   # cost on |v| for chassis x, y, yaw
+    # SPLIT into linear (x, y translation) vs yaw (base turn) because the two are
+    # different in unit AND in role: x/y are PRISMATIC (cost is per m/s), yaw is
+    # REVOLUTE (cost is per rad/s), so one shared number prices "translate 1 m" and
+    # "turn 1 rad" identically even though 1 rad/s ~= 57 deg/s is a fast spin while
+    # 1 m/s is a walk. And the roles differ: LOWER the yaw cost to let the base TURN
+    # to face a target (an alternative to contorting the arms / the waist on a twist),
+    # while keeping the LINEAR cost high so the base stays planted for in-reach
+    # targets. The hard velocity caps are already split this way
+    # (chassis_max_linear_velocity vs chassis_max_yaw_velocity); this makes the soft
+    # damping consistent. Tuned down from 25 after real-robot testing: a less
+    # reluctant base (yaw 8, linear 12) turns/walks to carry the arms sooner on a
+    # walk/turn (json9-11), which felt better; the Phase-1 dead-zone still keeps it
+    # planted while the operator is stationary.
+    damping_cost_chassis_linear: float = 12.0  # cost on |v| for chassis x, y (per m/s)
+    damping_cost_chassis_yaw: float = 8.0      # cost on |v| for chassis yaw (per rad/s)
+
+    # --- Mobile-base DEAD-ZONE (Phase 1: freeze the base while standing still) - #
+    # High chassis damping (above) only makes the base *reluctant*; AVP wrist
+    # jitter and near-singular solves can still slide/spin it a little while the
+    # operator is not actually walking (the "base spins in place / knee jitter /
+    # hand drags the base" failures). The dead-zone HARD-freezes the 3 chassis
+    # DOFs (velocity limit -> 0 inside the QP, coordinated: the arms still solve
+    # around a pinned base) whenever the operator's HEAD is not translating
+    # horizontally, and releases them once it moves. Gating on HORIZONTAL head
+    # speed (not vertical) means a pure squat/bend does not unfreeze the base
+    # (avoids the bend-induced base drift), while a real step does.
+    #
+    # Two thresholds give hysteresis so the base does not chatter between
+    # frozen/free near a single cutoff: freeze when the (EMA-smoothed) head speed
+    # drops below base_freeze_speed, unfreeze when it rises above
+    # base_unfreeze_speed (unfreeze > freeze). base_speed_alpha smooths the
+    # per-tick head-speed estimate (EMA in (0,1], smaller = smoother/laggier).
+    # base_deadzone is the master switch. Applied in sim_teleop via
+    # WholeBodyIK.set_base_frozen(); needs enforce_limits=True (the velocity
+    # limit is the freeze mechanism). Tune the speeds up if a slow real step
+    # fails to release the base, down if wrist motion alone releases it.
+    base_deadzone: bool = True
+    base_freeze_speed: float = 0.05      # m/s: below -> freeze the base
+    base_unfreeze_speed: float = 0.12    # m/s: above -> release the base
+    base_speed_alpha: float = 0.3        # EMA smoothing of the head-speed estimate
+
+    # --- Lean-spine DEAD-ZONE (Phase 1b: generalize the base dead-zone) ------ #
+    # The Phase-1 base dead-zone (freeze the chassis while the head is not
+    # translating horizontally) fixed the in-place base jitter (json1-3). The
+    # SAME mode-switching mechanism, gated on a DIFFERENT signal, fixes the
+    # in-place KNEE/lean jitter on those same clips: freeze the sagittal lean
+    # spine (torso_joint_1/2/3 = ankle/knee/hip pitch) while the operator is not
+    # squatting/bending, release it when they are. The gate is head VERTICAL
+    # speed (squat detection), orthogonal to the base's horizontal gate (walk
+    # detection). Measured separability is ~100x: stationary fine-control clips
+    # sit at head-vert p90 ~0.01 m/s while a squat/pickup clip hits p90 ~1.25;
+    # walking stays low (~0.10) so it does not false-trigger. Hysteresis (freeze
+    # below lean_freeze_speed, release above lean_unfreeze_speed) prevents
+    # chattering. Applied in sim_teleop via WholeBodyIK.set_lean_frozen(); needs
+    # enforce_limits=True (the velocity limit is the freeze mechanism).
+    lean_freeze_speed: float = 0.08      # m/s: head vert speed below -> freeze lean
+    lean_unfreeze_speed: float = 0.20    # m/s: head vert speed above -> release lean
+
+    # --- Phase 4: Continuous damping scheduling (chassis yaw × head yaw rate) - #
+    # Generalization of the dead-zone mode-switch into CONTINUOUS gain scheduling
+    # (Gemini's recommendation). Active ONLY when the base is unfrozen (speed >
+    # base_unfreeze_speed) -- the Phase-1 dead-zone handles low-speed/stationary
+    # (where AVP noise is worst), and the scheduler handles dynamic intent (fast
+    # turning). The chassis-yaw damping continuously LOWERS from the static value
+    # (damping_cost_chassis_yaw=8) toward a floor (yaw_schedule_floor=2) as the
+    # COMBINED yaw rate rises (hands-head yaw rate + head yaw rate), making the
+    # base cheaper to recruit for a turn instead of contorting arms/waist. The
+    # combined signal captures both "turn waist" (hands sweep, head static) and
+    # "turn body" (head + hands both turn). Damping cost itself is EMA-smoothed
+    # (alpha) to avoid QP objective jumps ("shift shock" /换挡冲击). Default OFF
+    # until data validates it on clip7/8/11.
+    enable_yaw_scheduling: bool = False
+    yaw_schedule_floor: float = 2.0       # chassis-yaw damping floor at high yaw rate
+    yaw_schedule_rate_low: float = 0.5    # combined yaw rate (rad/s) -> static damping
+    yaw_schedule_rate_high: float = 3.0   # combined yaw rate (rad/s) -> floor damping
+    yaw_schedule_alpha: float = 0.1       # EMA smoothing of damping cost itself
+
+    # --- Phase 4b: TRANSLATION (xy) continuous scheduling ------------------- #
+    # Same idea as the yaw scheduler but on the base translation, gated on head
+    # HORIZONTAL speed. Completes the "P/N/D gear" picture for the translation
+    # axis: P = frozen (< base_unfreeze_speed), N = unfrozen at static damping
+    # (base_unfreeze_speed .. trans_schedule_speed_low), D = walking fast enough
+    # that damping ramps down (> trans_schedule_speed_low) so the base carries
+    # the arms more eagerly. Deliberately GENTLE (the dead-zone + N gear already
+    # work well): damping only eases from damping_cost_chassis_linear=12 toward
+    # trans_schedule_floor=8 (67%), unlike the aggressive yaw ramp. Default OFF;
+    # kept only if it doesn't worsen hand tracking on the walk clips. Reuses
+    # base_speed_alpha for the damping EMA (shift-shock smoothing).
+    enable_trans_scheduling: bool = False
+    trans_schedule_floor: float = 8.0     # chassis-xy damping floor at high walk speed
+    trans_schedule_speed_low: float = 0.20   # head horiz speed (m/s) -> static damping (N->D)
+    trans_schedule_speed_high: float = 1.2   # head horiz speed (m/s) -> floor damping
+
+    # --- Phase 4b: independent base-yaw dead-zone (decouple turn from walk) --- #
+    # The Phase-1 base dead-zone freezes the WHOLE base (x/y/yaw) on head
+    # horizontal speed. That wrongly locks the yaw too when the operator turns
+    # IN PLACE (low translation, high turn intent -> base stayed frozen -> the
+    # turn failed, clip11). Phase-4b gives the base YAW its OWN dead-zone gated on
+    # the COMBINED yaw rate (hands-head + head), orthogonal to the xy dead-zone
+    # (head horizontal speed). So an in-place turn releases yaw while xy stays
+    # frozen. Only active when enable_yaw_scheduling is on; otherwise yaw mirrors
+    # the xy freeze (byte-identical to the pre-4b behaviour). Hysteresis band
+    # prevents chatter. (These are the same thresholds the scheduler's rate_low
+    # would imply, but a slightly lower freeze point + a release band decouple
+    # cleanly from the continuous-damping ramp above.)
+    base_yaw_freeze_rate: float = 0.15    # combined yaw rate below -> freeze base yaw
+    base_yaw_unfreeze_rate: float = 0.40  # above -> unfreeze base yaw (hysteresis)
+
+    # --- Base FOLLOWS HEAD (Phase 2: drive the base from head motion) -------- #
+    # Without this the base moves only REACTIVELY -- it is recruited when a hand
+    # FrameTask error beats the chassis damping, so on a big walk/turn the arms
+    # twist to reach the target instead of the base driving there (root cause A:
+    # json7-11). base_track_cost turns on a BaseTrackingTask that pulls the
+    # chassis x/y/yaw toward a per-tick reference which sim_teleop builds from the
+    # operator's head HORIZONTAL displacement (walk) + head YAW (turn) since
+    # calibration. The base then carries the arms along and the hands stay
+    # natural. Composes with the dead-zone: while the base is frozen (head not
+    # translating) the reference is held at the current base, so the base only
+    # follows once the operator actually walks -- and an in-place torso twist
+    # (no head translation, json7/8) keeps the base frozen and is handled by the
+    # waist/arms, exactly as intended.
+    #
+    # base_track_cost: task weight. Above damping_cost_chassis (25, a *velocity*
+    # cost) so the base actually tracks its *position* reference, but below the
+    # hand FrameTasks (arm_position_cost=10) so grasp precision still wins a
+    # genuine conflict. 0 disables (task not built -> byte-identical to Phase 1).
+    # base_follow_scale: metres of base motion per metre of head motion (1.0 =
+    # 1:1 walking; <1 shrinks the workspace, >1 amplifies). base_lean_drop: if
+    # the head drops more than this (m) below its calibration height the
+    # horizontal reference is HELD (a forward BEND drops+translates the head but
+    # is not a step; only near-level head motion advances the base -- avoids the
+    # bend-induced base drift). Yaw is not lean-gated (turning keeps head height).
+    # DEFAULT 0 (OFF) after clip evaluation (2026-07-14). Driving the base from
+    # HEAD displacement was measured to make hand tracking WORSE on the walk/turn
+    # clips (clip9 96->254 mm, clip10 144->510 mm, clip11 305->607 mm): the
+    # REACTIVE base (Phase-1 dead-zone + chassis damping) already moves the base
+    # to serve the hand FrameTasks, and a head-derived base target disagrees with
+    # what the arms need, so base_track_cost just competes with the hands over
+    # the shared chassis DOF and drags the base off the hand-optimal spot. The
+    # BaseTrackingTask mechanism is kept (verified, base-frozen composes with it)
+    # but the head->base *policy* is wrong for translation; the real gap is a
+    # robust TURN/heading signal (head-forward yaw is unstable when looking down)
+    # -- deferred to a future Phase 2b. Set > 0 only to experiment with an
+    # externally-supplied base target (see set_base_target).
+    base_track_cost: float = 0.0
+    base_follow_scale: float = 1.0
+    base_lean_drop: float = 0.08         # m: head drop above which xy-follow pauses
+
+    # --- Waist-yaw FOLLOWS the turn signal (Phase 2b: fix in-place twist) ---- #
+    # On an in-place torso twist (json7/8) the operator's head yaws but does not
+    # translate, so the dead-zone keeps the base frozen and the arms twist to
+    # reach the swept hand targets. This drives the WAIST (torso_joint_4) to turn
+    # with the operator instead, via a WaistYawTask that tracks the head's
+    # INTERAURAL (left-right) axis yaw since calibration. That axis was measured
+    # to stay horizontal even when looking down (mean|z|=0.03 on the deep-squat
+    # clip), so atan2 never degenerates -- unlike the gaze axis (Phase-2's bug).
+    #
+    # turn_follow_scale: the head interaural yaw = neck yaw + torso twist + body
+    # heading mixed, and it OVER-estimates true torso twist (turning the head to
+    # LOOK also counts), plus the neck FrameTask already tracks head orientation
+    # -- so scale < 1 attenuates to avoid over-rotating the waist. Main tuning
+    # knob; tune up if the waist under-follows a real twist, down if a head glance
+    # rotates the waist. waist_soft_limit: clamp the target below the hard joint
+    # limit (+/-1.53 rad) so the waist keeps margin. MUTUALLY EXCLUSIVE with the
+    # EgoPoser prior: when --egoposer is on, its NeuralPostureTask owns the waist
+    # (cleaner SMPL body-twist signal) and this task is NOT built. 0 disables.
+    # DEFAULT 0 (OFF) after clip evaluation (2026-07-15). IK-only replay (no sim
+    # divergence, sub-cm tracking) showed driving the waist from head interaural
+    # yaw does NOT reduce arm contortion on the in-place-twist clips and slightly
+    # hurts: clip7 arm_dev 10.62->11.06, clip8 hand_err 7.6->13.9 mm. Root cause
+    # (same as the Phase-2 translation finding): the REACTIVE hands already drive
+    # the waist to its hard limit (+/-1.53) on a big twist, so a head-yaw target
+    # has no headroom and only COMPETES with the hand FrameTasks. Freeing base
+    # yaw instead barely helps (chassis-yaw damping 25 makes the QP prefer
+    # contorting the arms). The interaural signal itself is sound (pitch-robust);
+    # the head->waist *policy* is the wrong lever. The WaistYawTask mechanism is
+    # kept + tested (selfcheck) for a future externally-supplied waist target.
+    # Set > 0 to experiment. NOTE: the clip7/8 sim blow-ups were mj_step servo
+    # divergence, NOT the IK (which tracks fine) -- a separate stability issue.
+    waist_yaw_follow_cost: float = 0.0
+    turn_follow_scale: float = 0.8       # head-yaw -> waist-yaw gain (<1: attenuate)
+    waist_soft_limit: float = 1.2        # rad: clamp waist target (hard limit 1.53)
+
+    # --- Hand-in-front SOFT GUARD (Phase 3: stop arms crossing behind back) -- #
+    # A one-sided penalty (see HandFrontTask) that nudges a hand forward ONLY
+    # once it goes behind a margin plane anchored at the pelvis (hip frame) and
+    # facing the robot forward. Inert when the hands are in front (the common
+    # case), so unlike the head-driven follow tasks it does not compete with the
+    # hand FrameTasks in normal use. Targets json9-11 (arms twist/cross behind
+    # the back on walk/turn). hand_front_cost: task weight -- keep BELOW
+    # arm_position_cost (10) so a genuine reach-behind still wins; it is a
+    # null-space bias ("turn to face" over "reach behind"), not a hard wall. 0
+    # disables (task not built). hand_front_margin: signed forward offset (m) of
+    # the guard plane from the hip; NEGATIVE puts it behind the hip so the
+    # natural rest pose (hands measured ~3-4 cm behind the hip on the fine-control
+    # clip) is not penalised -- only a gross reach-behind (measured to -1.0 m on
+    # the walk/turn clips) is. Base-invariant (hand + pelvis both ride the base).
+    # DEFAULT 0 (OFF) after clip evaluation (2026-07-15). IK-only replay showed
+    # the guard does NOT fix the json10/11 crossing (cross% 36→36, even with a
+    # free base) -- crossing is a LATERAL failure and this guard is a
+    # forward/backward penalty (wrong axis) -- and on the reach-behind clips it
+    # only marginally cuts behind-depth while HURTING hand tracking (clip7 24→35
+    # mm, clip9 349→440 mm), the same competition seen in Phase 2/2b. Root cause
+    # (now triply confirmed across Phase 2/2b/3): the hand FrameTargets are
+    # anchored to FIXED WORLD points (relative to calibration); when the operator
+    # walks/turns and the base doesn't follow, those world-fixed targets land
+    # behind/crossed relative to the robot -- the TARGET encodes the failure, so
+    # no guard on the robot config can fix it. The real fix is architectural:
+    # BODY-RELATIVE hand targets (anchored to a moving torso/pelvis frame), not a
+    # symptom guard. Mechanism kept + tested (one-sided, inert in front) for a
+    # future body-relative retarget. Set > 0 to experiment.
+    hand_front_cost: float = 0.0
+    hand_front_margin: float = -0.15     # m: guard plane this far behind the hip
 
     # --- Lowest tier: the sagittal lean spine (torso_joint_1/2/3) ----------- #
     # These three joints are the robot's hip/knee equivalent (see TORSO_JOINTS
@@ -521,11 +750,12 @@ class WholeBodyIKConfig:
         expensive (moves last):
 
             arms                     ``damping_cost_arm``      (moves first)
-            torso yaw + neck + lean  ``damping_cost`` / ``damping_cost_lean``
-            chassis / mobile base    ``damping_cost_chassis``  (last resort)
+            waist yaw                ``damping_cost_waist``
+            neck + lean              ``damping_cost`` / ``damping_cost_lean``
+            chassis linear / yaw     ``damping_cost_chassis_{linear,yaw}`` (last resort)
 
         The arm is the CHEAPEST DOF so a small in-reach hand motion is realised by
-        the arm alone; the torso/neck/lean are several times dearer so they stay
+        the arm alone; the waist/neck/lean are several times dearer so they stay
         put unless the arm cannot do the job (this fixes "the whole body follows a
         tiny wrist wiggle"). The lean spine (torso_joint_1/2/3) shares the
         torso/neck tier (``damping_cost_lean``); its ANTI-TIP behaviour is enforced
@@ -535,8 +765,8 @@ class WholeBodyIKConfig:
         so the base stays a last-resort reach DOF.
         """
         return self._assemble(
-            self.damping_cost_chassis, self.damping_cost_chassis,
-            self.damping_cost_lean, self.damping_cost,
+            self.damping_cost_chassis_linear, self.damping_cost_chassis_yaw,
+            self.damping_cost_lean, self.damping_cost_waist,
             self.damping_cost, self.damping_cost_arm,
         )
 
@@ -557,6 +787,16 @@ class PoseFilterConfig:
 
     alpha_translation: float = 0.5
     alpha_rotation: float = 0.5
+
+    # Outlier rejection (metres per 60 Hz tick): the largest jump the RAW
+    # translation target may make in one frame before it is clamped, applied
+    # ahead of the EMA (see PoseFilter). AVP occasionally emits a corrupt pose
+    # or resumes after a dropout with the hand already moved far; a single big
+    # jump through the near-singular arm Jacobian makes the robot twitch. 0.08 m
+    # /tick ~= 4.8 m/s, well above any real hand speed, so only true outliers
+    # are clamped and genuine motion just ramps over a few ticks. Set 0 to
+    # disable (e.g. to A/B the effect).
+    max_translation_jump: float = 0.08
 
 
 def _default_egoposer_weights() -> str:

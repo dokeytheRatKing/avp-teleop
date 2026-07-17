@@ -38,10 +38,10 @@ from avp_teleop.selfcheck import _synthetic_hand
 
 from avp_teleop_upper_body.config import (
     default_config, MJCF_PATH, BODY_JOINTS, IK_KEEP_JOINTS, BODY_HOME,
-    HEAD_FRAME_BODY, CHASSIS_BASE_FRAME, TORSO_LEAN_JOINTS, NEURAL_WAIST_JOINT,
-    NEURAL_PITCH_JOINT,
+    HEAD_FRAME_BODY, CHASSIS_BASE_FRAME, CHASSIS_IK_JOINT, TORSO_LEAN_JOINTS,
+    NEURAL_WAIST_JOINT, NEURAL_PITCH_JOINT,
     TOOL_BODY, CHEST_HEAD_FRAME, CHEST_HIP_FRAME, CHEST_ANKLE_FRAME,
-    all_finger_joints, finger_specs,
+    WAIST_LINK_BODY, all_finger_joints, finger_specs,
 )
 from avp_teleop_upper_body.transport import (
     HeadFrame, HeadFramePublisher, UpperBodySubscriber,
@@ -153,7 +153,30 @@ def check_pose_filter() -> bool:
     if R is not None:
         _fail("pose filter", "rotation returned when not tracked")
         return False
-    _ok("pose filter: EMA translation + SLERP rotation (pass-through/half/reset)")
+
+    # Phase-0 outlier clamp: a raw jump beyond max_translation_jump is pulled
+    # back onto that radius BEFORE the (alpha=1 here, pass-through) EMA, while a
+    # small jump passes untouched.
+    fc = PoseFilter(1.0, 1.0, max_translation_jump=0.10)
+    fc.filter(np.zeros(3), None)                       # anchor at origin
+    p, _ = fc.filter(np.array([1.0, 0.0, 0.0]), None)  # 1.0 m outlier -> clamp
+    if not np.allclose(p, [0.10, 0.0, 0.0], atol=1e-9):
+        _fail("pose filter", f"outlier not clamped to 0.10 m: {p}")
+        return False
+    fc.reset(); fc.filter(np.zeros(3), None)
+    p, _ = fc.filter(np.array([0.03, 0.0, 0.0]), None)  # within cap -> untouched
+    if not np.allclose(p, [0.03, 0.0, 0.0], atol=1e-9):
+        _fail("pose filter", f"in-cap jump wrongly clamped: {p}")
+        return False
+    # 0 disables the clamp (a huge jump passes through).
+    f0 = PoseFilter(1.0, 1.0, max_translation_jump=0.0)
+    f0.filter(np.zeros(3), None)
+    p, _ = f0.filter(np.array([5.0, 0.0, 0.0]), None)
+    if not np.allclose(p, [5.0, 0.0, 0.0], atol=1e-9):
+        _fail("pose filter", "clamp not disabled at max_translation_jump=0")
+        return False
+
+    _ok("pose filter: EMA + SLERP + outlier clamp (pass-through/half/reset/clamp)")
     return True
 
 
@@ -175,7 +198,9 @@ def check_model(cfg):
 
 def _build_ik(cfg, *, head_ori, arm_ori, damping=None, low_accel=None,
               enforce=None, com_cost=None, trunk_upright_cost=None,
-              chest_over_ankle_cost=None, neural_posture_cost=None):
+              chest_over_ankle_cost=None, neural_posture_cost=None,
+              base_track_cost=None, waist_yaw_follow_cost=None,
+              hand_front_cost=None):
     return WholeBodyIK(
         MJCF_PATH, IK_KEEP_JOINTS, HEAD_FRAME_BODY,
         TOOL_BODY["left"], TOOL_BODY["right"], np.array(BODY_HOME),
@@ -207,6 +232,18 @@ def _build_ik(cfg, *, head_ori, arm_ori, damping=None, low_accel=None,
         config_limit_gain=cfg.ik.config_limit_gain, control_dt=cfg.ik.control_dt,
         enforce_limits=cfg.ik.enforce_limits if enforce is None else enforce,
         solver=cfg.ik.solver,
+        base_joint_name=CHASSIS_IK_JOINT,
+        base_track_cost=(cfg.ik.base_track_cost if base_track_cost is None
+                         else base_track_cost),
+        waist_yaw_follow_cost=(cfg.ik.waist_yaw_follow_cost
+                               if waist_yaw_follow_cost is None
+                               else waist_yaw_follow_cost),
+        waist_joint_name=NEURAL_WAIST_JOINT,
+        hand_front_cost=(cfg.ik.hand_front_cost if hand_front_cost is None
+                         else hand_front_cost),
+        hand_front_margin=cfg.ik.hand_front_margin,
+        hand_front_pelvis_frame_name=CHEST_HIP_FRAME,
+        hand_front_waist_frame_name=WAIST_LINK_BODY,
     )
 
 
@@ -255,6 +292,52 @@ def check_merged_ik(cfg, model, data) -> bool:
     _fail("merged IK", f"errs(mm)={ {n: round(e*1000,2) for n,e in errs.items()} }, "
           f"within_limits={in_lim}")
     return False
+
+
+def check_solve_guard(cfg, model, data) -> bool:
+    """Phase-0 safety net: solve() must NEVER return a non-finite or out-of-
+    limit configuration, even for absurd / far-unreachable / degenerate targets
+    that can drive the QP near-singular. This is what stops the "Nan, Inf or
+    huge value in QACC" sim blow-up seen on aggressive clips."""
+    try:
+        ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0)
+    except Exception as e:
+        _fail("solve guard", f"build failed: {e}")
+        return False
+
+    home = np.array(BODY_HOME)
+    # A battery of pathological targets: 100 m away, at the origin (collapses the
+    # arm), NaN, and Inf. None may produce a non-finite or out-of-limit result;
+    # the run must also stay stable across many ticks (no divergence).
+    R = np.eye(3)
+    cases = {
+        "far":     (np.array([100.0, 100.0, 100.0]), R),
+        "origin":  (np.array([0.0, 0.0, 0.0]), R),
+        "nan":     (np.array([np.nan, 0.0, 1.0]), R),
+        "inf":     (np.array([np.inf, 0.0, 1.0]), R),
+    }
+    for name, tgt in cases.items():
+        q = home.copy()
+        for _ in range(60):
+            q = ik.solve(q, tgt, tgt, tgt)
+            if not np.all(np.isfinite(q)):
+                _fail("solve guard", f"[{name}] non-finite q from solve()")
+                return False
+        if not (np.all(q >= ik.lower - 1e-6) and np.all(q <= ik.upper + 1e-6)):
+            _fail("solve guard", f"[{name}] q escaped joint limits")
+            return False
+
+    # Sanity: after abusing it, a normal reachable target still solves finite.
+    q = home.copy()
+    good = (np.array([0.3, 0.0, 0.9]), R)
+    for _ in range(60):
+        q = ik.solve(q, good, good, good)
+    if not np.all(np.isfinite(q)):
+        _fail("solve guard", "non-finite q on a normal target after abuse")
+        return False
+
+    _ok("solve guard: NaN/Inf/far/origin targets -> finite, in-limit q (no blow-up)")
+    return True
 
 
 def check_auto_compensation(cfg, model, data) -> bool:
@@ -327,7 +410,10 @@ def check_whole_body(cfg, model, data) -> bool:
         cover) clearly translates the base -- and tracks it -- proving the base
         is a last-resort DOF, not an eager one.
     """
-    ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0)
+    # base_track_cost=0: this check isolates REACTIVE base recruitment (base
+    # moves because the hand can't reach), so the Phase-2 follow task (which
+    # would pull the base toward its default (0,0,0) target) must be off here.
+    ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0, base_track_cost=0.0)
     body_adr = _body_qpos_adr(model)
     home = np.array(BODY_HOME)
     names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
@@ -390,6 +476,489 @@ def check_whole_body(cfg, model, data) -> bool:
     _ok(f"whole-body base (round-trip {rt_err*1000:.2f} mm; base "
         f"{base_near*100:.1f}cm near vs {base_far*100:.1f}cm far, "
         f"far tracks {err_far*1000:.1f}mm)")
+    return True
+
+
+def check_base_deadzone(cfg, model, data) -> bool:
+    """Phase-1 base dead-zone: set_base_frozen(True) must PIN the chassis inside
+    the QP (a far target that normally recruits the base leaves it ~put), and
+    set_base_frozen(False) must release it (the SAME target moves the base). Also
+    checks the toggle is a coordinated in-QP freeze (arms still solve, output
+    finite) and that frozen->unfrozen is reversible."""
+    # base_track_cost=0: isolate the freeze mechanism from the Phase-2 follow
+    # task (which pulls toward its target); the unfreeze arm here relies on
+    # REACTIVE recruitment to a far hand target.
+    ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0, base_track_cost=0.0)
+    body_adr = _body_qpos_adr(model)
+    home = np.array(BODY_HOME)
+    names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
+    base0 = _fk_frames(model, data, body_adr, home, names)
+
+    # A rigid 0.5 m forward shift on all three targets -- beyond arm reach, so a
+    # FREE base must translate to track it (see check_whole_body).
+    shift = np.array([0.50, 0.0, 0.0])
+
+    def _run(frozen, iters=400):
+        ik.reset()
+        ik.set_base_frozen(frozen)
+        targets = {nm: (base0[nm][1] + shift, None) for nm in names}
+        q = home.copy()
+        for _ in range(iters):
+            q = ik.solve(q, targets[names[0]], targets[names[1]], targets[names[2]])
+            if not np.all(np.isfinite(q)):
+                return None, None
+        base_disp = float(np.linalg.norm(q[_CHASSIS][:2] - home[_CHASSIS][:2]))
+        return q, base_disp
+
+    q_frozen, base_frozen_disp = _run(True)
+    if q_frozen is None:
+        _fail("base dead-zone", "non-finite q while base frozen")
+        return False
+    if base_frozen_disp > 5e-3:
+        _fail("base dead-zone", f"frozen base still moved {base_frozen_disp*100:.1f} "
+              f"cm (should be ~0)")
+        return False
+    if not ik.base_frozen:
+        _fail("base dead-zone", "base_frozen flag not set after freeze")
+        return False
+
+    q_free, base_free_disp = _run(False)
+    if q_free is None:
+        _fail("base dead-zone", "non-finite q after unfreeze")
+        return False
+    if base_free_disp < 0.20:
+        _fail("base dead-zone", f"unfrozen base only moved {base_free_disp*100:.1f} "
+              f"cm for a far target (freeze not released?)")
+        return False
+    if ik.base_frozen:
+        _fail("base dead-zone", "base_frozen flag still set after unfreeze")
+        return False
+
+    _ok(f"base dead-zone: freeze pins base ({base_frozen_disp*100:.2f} cm) vs "
+        f"free moves it ({base_free_disp*100:.1f} cm) for the same far target")
+    return True
+
+
+def check_base_axis_split(cfg, model, data) -> bool:
+    """Phase-4b: base translation (xy) and yaw freeze INDEPENDENTLY. With a target
+    that recruits BOTH (a far forward shift + a 90 deg turn), freezing xy-only
+    must still let the base YAW move (turn in place, no translation), and
+    freezing yaw-only must still let xy move (translate, no turn). Proves an
+    in-place turn (low translation, high turn intent) can release yaw while xy
+    stays frozen -- the clip11 fix."""
+    ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0, base_track_cost=0.0)
+    body_adr = _body_qpos_adr(model)
+    home = np.array(BODY_HOME)
+    names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
+    base0 = _fk_frames(model, data, body_adr, home, names)
+
+    # Combined target: 0.5 m forward shift AND a 90 deg rotation of the three
+    # frames about their xy centroid -- an unfrozen base both translates and
+    # turns to track it.
+    centroid = np.mean([base0[nm][1][:2] for nm in names], axis=0)
+    shift = np.array([0.50, 0.0, 0.0])
+    def _tf(pos):
+        rel = pos[:2] - centroid
+        rot = np.array([-rel[1], rel[0]])          # 90 deg CCW
+        return np.array([rot[0] + centroid[0] + shift[0],
+                         rot[1] + centroid[1] + shift[1], pos[2]])
+    tgt = {nm: (_tf(base0[nm][1]), None) for nm in names}
+
+    def _run(xy_frozen, yaw_frozen, iters=400):
+        ik.reset()
+        ik.set_base_xy_frozen(xy_frozen)
+        ik.set_base_yaw_frozen(yaw_frozen)
+        q = home.copy()
+        for _ in range(iters):
+            q = ik.solve(q, tgt[names[0]], tgt[names[1]], tgt[names[2]])
+            if not np.all(np.isfinite(q)):
+                return None, None, None
+        xy_disp = float(np.linalg.norm(q[_CHASSIS][:2] - home[_CHASSIS][:2]))
+        yaw_disp = abs(q[2] - home[2])
+        return q, xy_disp, yaw_disp
+
+    # (a) xy frozen, yaw free -> yaw moves, xy pinned.
+    q, xy_d, yaw_d = _run(xy_frozen=True, yaw_frozen=False)
+    if q is None:
+        _fail("base axis split", "non-finite q (xy frozen, yaw free)")
+        return False
+    if xy_d > 5e-3 or yaw_d < 0.05:
+        _fail("base axis split", f"xy-frozen/yaw-free: xy moved {xy_d*100:.1f}cm "
+              f"(want ~0), yaw moved {yaw_d:.3f}rad (want >0)")
+        return False
+
+    # (b) yaw frozen, xy free -> xy moves, yaw pinned.
+    q, xy_d2, yaw_d2 = _run(xy_frozen=False, yaw_frozen=True)
+    if q is None:
+        _fail("base axis split", "non-finite q (yaw frozen, xy free)")
+        return False
+    if yaw_d2 > 5e-3 or xy_d2 < 0.05:
+        _fail("base axis split", f"yaw-frozen/xy-free: yaw moved {yaw_d2:.3f}rad "
+              f"(want ~0), xy moved {xy_d2*100:.1f}cm (want >0)")
+        return False
+
+    _ok(f"base axis split: xy-frozen turns only (xy {xy_d*100:.2f}cm, yaw "
+        f"{yaw_d:.2f}rad); yaw-frozen translates only (xy {xy_d2*100:.1f}cm, "
+        f"yaw {yaw_d2:.3f}rad)")
+    return True
+
+
+def check_lean_freeze(cfg, model, data) -> bool:
+    """Phase-1b lean-spine dead-zone: set_lean_frozen(True) must PIN the sagittal
+    lean spine (torso_joint_1/2/3) inside the QP -- a squat target (head+hands
+    driven straight down, which normally folds the lean spine) leaves the lean
+    angles ~unchanged -- and set_lean_frozen(False) must release it (the SAME
+    squat target then folds the spine). Mirrors check_base_deadzone but on the
+    lean DOFs with a vertical (squat) target instead of a horizontal reach."""
+    ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0, base_track_cost=0.0)
+    body_adr = _body_qpos_adr(model)
+    home = np.array(BODY_HOME)
+    names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
+    base0 = _fk_frames(model, data, body_adr, home, names)
+
+    # A genuine squat: drive head + both hands straight DOWN together. Tracking
+    # it requires folding the lean spine (accordion), so a FREE spine moves and a
+    # FROZEN spine holds. Orientation targets kept at home (position-only drive).
+    drop = np.array([0.0, 0.0, -0.20])
+
+    def _run(frozen, iters=400):
+        ik.reset()
+        ik.set_lean_frozen(frozen)
+        tgt = {nm: (base0[nm][1] + drop, None) for nm in names}
+        q = home.copy()
+        for _ in range(iters):
+            q = ik.solve(q, tgt[names[0]], tgt[names[1]], tgt[names[2]])
+            if not np.all(np.isfinite(q)):
+                return None, None
+        lean_move = float(np.abs(q[_LEAN] - home[_LEAN]).sum())
+        return q, lean_move
+
+    q_frozen, lean_frozen_move = _run(True)
+    if q_frozen is None:
+        _fail("lean freeze", "non-finite q while lean frozen")
+        return False
+    if lean_frozen_move > 0.05:
+        _fail("lean freeze", f"frozen lean spine still moved {lean_frozen_move:.3f} "
+              f"rad (should be ~0)")
+        return False
+    if not ik.lean_frozen:
+        _fail("lean freeze", "lean_frozen flag not set after freeze")
+        return False
+
+    q_free, lean_free_move = _run(False)
+    if q_free is None:
+        _fail("lean freeze", "non-finite q after unfreeze")
+        return False
+    if lean_free_move < 0.30:
+        _fail("lean freeze", f"unfrozen lean spine only moved {lean_free_move:.3f} "
+              f"rad for a squat (freeze not released?)")
+        return False
+    if ik.lean_frozen:
+        _fail("lean freeze", "lean_frozen flag still set after unfreeze")
+        return False
+
+    _ok(f"lean freeze: freeze pins lean spine ({lean_frozen_move:.3f} rad) vs "
+        f"free folds it ({lean_free_move:.2f} rad) for the same squat target")
+    return True
+
+
+def check_yaw_scheduling(cfg, model, data) -> bool:
+    """Phase-4 continuous damping scheduling: set_chassis_yaw_damping() must
+    dynamically change the chassis-yaw damping cost and affect the solve ONLY
+    when the base is unfrozen (when frozen, velocityLimit=0 dominates and the
+    damping value is moot). Verifies (a) frozen + high yaw rate -> base still
+    pinned (scheduler doesn't interfere with dead-zone), (b) unfrozen + scheduler
+    lowering damping -> base yaw recruited more (cheaper), (c) no NaN/divergence."""
+    ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0, base_track_cost=0.0)
+    body_adr = _body_qpos_adr(model)
+    home = np.array(BODY_HOME)
+    names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
+    base0 = _fk_frames(model, data, body_adr, home, names)
+
+    # A target that requires base yaw: rigid 90° CCW rotation of all three
+    # frames around the vertical axis at their current xy centroid.
+    centroid = np.mean([base0[nm][1][:2] for nm in names], axis=0)
+    R_90 = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=float)
+    def _rotate_tgt(pos):
+        rel = pos[:2] - centroid
+        rot = R_90[:2, :2] @ rel
+        return np.array([rot[0] + centroid[0], rot[1] + centroid[1], pos[2]])
+    tgt = {nm: (_rotate_tgt(base0[nm][1]), None) for nm in names}
+
+    def _run(frozen, damping, iters=400):
+        ik.reset()
+        ik.set_base_frozen(frozen)
+        ik.set_chassis_yaw_damping(damping)
+        q = home.copy()
+        for _ in range(iters):
+            q = ik.solve(q, tgt[names[0]], tgt[names[1]], tgt[names[2]])
+            if not np.all(np.isfinite(q)):
+                return None, None
+        yaw_move = abs(q[2] - home[2])
+        return q, yaw_move
+
+    # (a) Frozen + low damping -> base still pinned (velocityLimit dominates).
+    q_frz, yaw_frz = _run(frozen=True, damping=2.0)
+    if q_frz is None:
+        _fail("yaw scheduling", "non-finite q while frozen + low damping")
+        return False
+    if yaw_frz > 5e-3:
+        _fail("yaw scheduling", f"frozen base moved {yaw_frz:.4f} rad even with "
+              f"low damping (scheduler interfered with dead-zone freeze)")
+        return False
+
+    # (b) Unfrozen + high damping (static) vs low damping (scheduled floor) ->
+    # low damping recruits base yaw more.
+    q_hi, yaw_hi = _run(frozen=False, damping=cfg.ik.damping_cost_chassis_yaw)
+    q_lo, yaw_lo = _run(frozen=False, damping=cfg.ik.yaw_schedule_floor)
+    if q_hi is None or q_lo is None:
+        _fail("yaw scheduling", "non-finite q while unfrozen")
+        return False
+    if yaw_lo <= yaw_hi:
+        _fail("yaw scheduling", f"low damping ({cfg.ik.yaw_schedule_floor}) did not "
+              f"recruit base yaw more than high damping ({cfg.ik.damping_cost_chassis_yaw}): "
+              f"{yaw_lo:.3f} vs {yaw_hi:.3f} rad")
+        return False
+
+    _ok(f"yaw scheduling: frozen pins base ({yaw_frz:.4f} rad), unfrozen damping "
+        f"{cfg.ik.damping_cost_chassis_yaw}->{cfg.ik.yaw_schedule_floor} recruits "
+        f"base yaw {yaw_hi:.3f}->{yaw_lo:.3f} rad")
+    return True
+
+
+def check_trans_scheduling(cfg, model, data) -> bool:
+    """Phase-4b translation scheduling: set_chassis_xy_damping() dynamically
+    changes the base xy damping and affects the solve only when xy is unfrozen.
+    (a) xy frozen + low damping -> base xy still pinned (velocityLimit dominates);
+    (b) unfrozen: lower xy damping recruits MORE base translation than the static
+    value, for a far forward target."""
+    ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0, base_track_cost=0.0)
+    body_adr = _body_qpos_adr(model)
+    home = np.array(BODY_HOME)
+    names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
+    base0 = _fk_frames(model, data, body_adr, home, names)
+
+    # A MODERATE forward shift: partially reachable by the arms, so the base/arm
+    # tradeoff is active and the base displacement is damping-sensitive (a far
+    # target would saturate the base fully regardless of damping). Lower xy
+    # damping -> the QP recruits the base more (arms stretch less).
+    shift = np.array([0.18, 0.0, 0.0])
+    tgt = {nm: (base0[nm][1] + shift, None) for nm in names}
+
+    def _run(frozen, damping, iters=400):
+        ik.reset()
+        ik.set_base_frozen(frozen)
+        ik.set_chassis_xy_damping(damping)
+        q = home.copy()
+        for _ in range(iters):
+            q = ik.solve(q, tgt[names[0]], tgt[names[1]], tgt[names[2]])
+            if not np.all(np.isfinite(q)):
+                return None, None
+        return q, float(np.linalg.norm(q[_CHASSIS][:2] - home[_CHASSIS][:2]))
+
+    # (a) Frozen + low damping -> xy still pinned.
+    q_frz, xy_frz = _run(frozen=True, damping=cfg.ik.trans_schedule_floor)
+    if q_frz is None:
+        _fail("trans scheduling", "non-finite q while frozen + low damping")
+        return False
+    if xy_frz > 5e-3:
+        _fail("trans scheduling", f"frozen base moved {xy_frz*100:.1f} cm even with "
+              f"low damping (scheduler interfered with dead-zone freeze)")
+        return False
+
+    # (b) Unfrozen: low (floor) damping recruits more xy than static.
+    q_hi, xy_hi = _run(frozen=False, damping=cfg.ik.damping_cost_chassis_linear)
+    q_lo, xy_lo = _run(frozen=False, damping=cfg.ik.trans_schedule_floor)
+    if q_hi is None or q_lo is None:
+        _fail("trans scheduling", "non-finite q while unfrozen")
+        return False
+    if xy_lo <= xy_hi:
+        _fail("trans scheduling", f"floor damping ({cfg.ik.trans_schedule_floor}) did "
+              f"not recruit base xy more than static "
+              f"({cfg.ik.damping_cost_chassis_linear}): {xy_lo*100:.1f} vs "
+              f"{xy_hi*100:.1f} cm")
+        return False
+
+    _ok(f"trans scheduling: frozen pins base ({xy_frz*100:.2f} cm), unfrozen damping "
+        f"{cfg.ik.damping_cost_chassis_linear}->{cfg.ik.trans_schedule_floor} recruits "
+        f"base xy {xy_hi*100:.1f}->{xy_lo*100:.1f} cm")
+    return True
+
+
+def check_base_follow(cfg, model, data) -> bool:
+    """Phase-2 base-follows-head: with the base-tracking task active and a
+    commanded (x, y, yaw) reference, the chassis DOFs must CONVERGE to that
+    reference (proving the task drives the base to a set point, not just
+    reactively). Also the composition guard: while the base is FROZEN the same
+    far reference must NOT move the base (Phase-1 hard velocity limit overrides
+    the Phase-2 soft task). Targets that DON'T need the base to reach the hands,
+    so any base motion here is the follow task, not hand-reach recruitment."""
+    # base_track_cost defaults to 0 (head->base policy disproven on clips, see
+    # config), so build the task explicitly here to verify the MECHANISM still
+    # works for a future externally-supplied base target.
+    ik = _build_ik(cfg, head_ori=0.0, arm_ori=0.0, base_track_cost=8.0)
+    if ik.base_task is None:
+        _fail("base follow", "base task not built (base_track_cost=0?)")
+        return False
+    body_adr = _body_qpos_adr(model)
+    home = np.array(BODY_HOME)
+    names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
+    # Hold the hands/head at their HOME poses so the FrameTasks are satisfied at
+    # q=home and don't themselves recruit the base -- isolates the follow task.
+    home_fk = _fk_frames(model, data, body_adr, home, names)
+    h_t = (home_fk[names[0]][1], None)
+    l_t = (home_fk[names[1]][1], None)
+    r_t = (home_fk[names[2]][1], None)
+
+    # (a) UNFROZEN: command a base reference and confirm the chassis converges.
+    tx, ty, tyaw = 0.30, -0.20, 0.40
+    ik.reset(); ik.set_base_frozen(False); ik.set_base_target(tx, ty, tyaw)
+    q = home.copy()
+    for _ in range(300):
+        q = ik.solve(q, h_t, l_t, r_t)
+    err = np.array([q[0] - tx, q[1] - ty, q[2] - tyaw])
+    err[2] = (err[2] + np.pi) % (2 * np.pi) - np.pi
+    if not np.all(np.isfinite(q)):
+        _fail("base follow", "non-finite q while following")
+        return False
+    # Tolerance matches the base_track_cost=8 equilibrium on this STEP target
+    # (~3 cm residual): a step is a stress test -- real teleop head targets move
+    # continuously so the base lag is small. We assert the base closes most of a
+    # 0.36 m diagonal step (<5 cm residual = >85% closed) and yaw ~exact.
+    if np.linalg.norm(err[:2]) > 0.05 or abs(err[2]) > 0.05:
+        _fail("base follow", f"base did not reach target: xy err "
+              f"{np.linalg.norm(err[:2])*100:.1f} cm, yaw err {abs(err[2]):.3f} rad")
+        return False
+
+    # (b) FROZEN overrides follow: same far reference, base must stay ~put.
+    ik.reset(); ik.set_base_frozen(True); ik.set_base_target(tx, ty, tyaw)
+    q = home.copy()
+    for _ in range(300):
+        q = ik.solve(q, h_t, l_t, r_t)
+    frozen_disp = float(np.linalg.norm(q[_CHASSIS][:2] - home[_CHASSIS][:2]))
+    frozen_yaw = abs(q[2] - home[2])
+    if frozen_disp > 5e-3 or frozen_yaw > 5e-3:
+        _fail("base follow", f"frozen base followed anyway ({frozen_disp*100:.1f} "
+              f"cm, {frozen_yaw:.3f} rad) -- Phase-1 freeze should override")
+        return False
+
+    _ok(f"base follow: chassis converges to (x,y,yaw) target (err "
+        f"{np.linalg.norm(err[:2])*100:.2f} cm / {abs(err[2]):.3f} rad); "
+        f"freeze overrides follow ({frozen_disp*100:.2f} cm)")
+    return True
+
+
+def check_waist_yaw_follow(cfg, model, data) -> bool:
+    """Phase-2b waist-yaw follow: with the WaistYawTask active and a commanded
+    yaw, torso_joint_4 must converge to it; a target beyond the soft limit is
+    clamped (the task tracks the clamped value sim_teleop sends). Also the
+    EgoPoser mutual-exclusion: the task is NOT built when neural_posture_cost>0."""
+    ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0, waist_yaw_follow_cost=2.0)
+    if ik.waist_task is None:
+        _fail("waist yaw follow", "waist task not built (waist_yaw_follow_cost=0?)")
+        return False
+    body_adr = _body_qpos_adr(model)
+    home = np.array(BODY_HOME)
+    names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
+    # Hold hands/head at their home poses so the FrameTasks are satisfied at home
+    # and don't recruit the waist -- isolates the waist-yaw task.
+    home_fk = _fk_frames(model, data, body_adr, home, names)
+    h_t = (home_fk[names[0]][1], None)
+    l_t = (home_fk[names[1]][1], None)
+    r_t = (home_fk[names[2]][1], None)
+
+    # (a) command a reachable waist yaw; torso_joint_4 must converge to it.
+    # Freeze the base so this isolates the WAIST mechanism -- with the base free
+    # and the (tuned-down) chassis-yaw damping, the QP would reactively borrow a
+    # little base yaw to help, which is the intended whole-body behaviour but
+    # not what this unit check is measuring.
+    tgt = 0.5
+    ik.reset(); ik.set_base_frozen(True); ik.set_waist_yaw_target(tgt)
+    q = home.copy()
+    for _ in range(200):
+        q = ik.solve(q, h_t, l_t, r_t)
+    waist = float(q[_WAIST][0])
+    if not np.all(np.isfinite(q)):
+        _fail("waist yaw follow", "non-finite q while following")
+        return False
+    if abs(waist - tgt) > 0.03:
+        _fail("waist yaw follow", f"waist did not reach target: {waist:.3f} vs {tgt}")
+        return False
+    # base yaw must stay ~0 (frozen base -> the waist task alone realises the turn).
+    if abs(q[2] - home[2]) > 5e-3:
+        _fail("waist yaw follow", f"base yaw moved ({q[2]:.3f}) -- should be ~0")
+        return False
+
+    # (b) EgoPoser mutual exclusion: task NOT built when neural prior is on.
+    ik2 = _build_ik(cfg, head_ori=1.0, arm_ori=1.0,
+                    waist_yaw_follow_cost=2.0, neural_posture_cost=0.8)
+    if ik2.waist_task is not None:
+        _fail("waist yaw follow", "waist task built despite EgoPoser (should be "
+              "mutually exclusive)")
+        return False
+
+    _ok(f"waist yaw follow: torso_joint_4 tracks target ({waist:.3f} rad, base "
+        f"yaw held ~0); mutually exclusive with EgoPoser prior")
+    return True
+
+
+def check_hand_front(cfg, model, data) -> bool:
+    """Phase-3 hand-in-front guard: the task is a ONE-SIDED penalty -- inert
+    (zero error + zero Jacobian) when a hand is in front of the margin plane,
+    active (nonzero, pulling forward) when behind. Verified deterministically by
+    sliding the margin plane across the home hand offset (avoids contorting the
+    arm). Also: a solve with the guard on stays finite and doesn't wreck home
+    tracking (the guard is inert there, so home is untouched)."""
+    import pink
+    ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0, hand_front_cost=5.0)
+    if ik.hand_front_task is None:
+        _fail("hand front", "hand-front task not built (hand_front_cost=0?)")
+        return False
+    task = ik.hand_front_task
+    home = np.array(BODY_HOME)
+    cfg0 = pink.Configuration(ik.model, ik.data, ik._to_model_q(home))
+
+    # Home tool forward-offset from the hip (signed, along robot forward).
+    fwd = cfg0.data.oMf[task.waist_id].rotation[:, 0]
+    pelvis = cfg0.data.oMf[task.pelvis_id].translation
+    s_left = float(np.dot(cfg0.data.oMf[task.left_id].translation - pelvis, fwd))
+
+    # (a) margin well BEHIND the hands (plane far back) -> hands in front -> inert.
+    task.margin = s_left - 0.5
+    e_front = task.compute_error(cfg0)
+    J_front = task.compute_jacobian(cfg0)
+    if not (np.allclose(e_front, 0.0) and np.allclose(J_front, 0.0)):
+        _fail("hand front", f"not inert when hands in front: e={e_front}")
+        return False
+
+    # (b) margin well IN FRONT of the hands (plane ahead) -> hands 'behind' it ->
+    # active: negative error + a nonzero Jacobian row pulling forward.
+    task.margin = s_left + 0.5
+    e_back = task.compute_error(cfg0)
+    J_back = task.compute_jacobian(cfg0)
+    if not (e_back[0] < -0.1 and not np.allclose(J_back[0], 0.0)):
+        _fail("hand front", f"not active when hands behind: e={e_back}")
+        return False
+
+    # (c) with the real (default) margin the guard is inert at home, so a solve
+    # tracking the home tool poses stays finite and on-target (guard adds nothing).
+    task.margin = cfg.ik.hand_front_margin
+    body_adr = _body_qpos_adr(model)
+    names = [HEAD_FRAME_BODY, TOOL_BODY["left"], TOOL_BODY["right"]]
+    fk = _fk_frames(model, data, body_adr, home, names)
+    tgts = [(fk[n][1], None) for n in names]
+    ik.reset(); ik.set_base_frozen(False)
+    q = home.copy()
+    for _ in range(60):
+        q = ik.solve(q, tgts[0], tgts[1], tgts[2])
+    sol = _fk_frames(model, data, body_adr, q, names)
+    err = max(float(np.linalg.norm(sol[n][1] - fk[n][1])) for n in names)
+    if not (np.all(np.isfinite(q)) and err < 5e-3):
+        _fail("hand front", f"guard perturbed home tracking: {err*1000:.1f} mm")
+        return False
+
+    _ok(f"hand front: one-sided guard inert in front / active behind "
+        f"(home offset {s_left:+.2f} m); home tracking intact ({err*1000:.2f} mm)")
     return True
 
 
@@ -621,8 +1190,13 @@ def check_smoothing(cfg, model, data) -> bool:
         err = max(float(np.linalg.norm(sol[nm][1] - tgt[nm][1])) for nm in names)
         return np.array(speeds), np.array(accels), err
 
+    # base_track_cost=0 throughout: this check isolates the DampingTask /
+    # LowAccelerationTask smoothing on a pure arm slew (no base motion needed),
+    # so the Phase-2 follow task (which pulls the base toward its default target
+    # and couples into the arm solution) must be off.
     # (a) default (gentle) costs with the full stack still track the target.
-    _, _, err_default = _run(_build_ik(cfg, head_ori=1.0, arm_ori=1.0))
+    _, _, err_default = _run(_build_ik(cfg, head_ori=1.0, arm_ori=1.0,
+                                       base_track_cost=0.0))
     if not (err_default < 5e-3):
         _fail("smoothing", f"default smoothing broke tracking: {err_default*1000:.1f} mm")
         return False
@@ -632,11 +1206,14 @@ def check_smoothing(cfg, model, data) -> bool:
     # sign). Limits off => peaks are large; the soft cost must shrink them.
     BIG = 10.0
     sp_plain, ac_plain, _ = _run(_build_ik(cfg, head_ori=1.0, arm_ori=1.0,
-                                           damping=0.0, low_accel=0.0, enforce=False))
+                                           damping=0.0, low_accel=0.0, enforce=False,
+                                           base_track_cost=0.0))
     sp_damp, _, _ = _run(_build_ik(cfg, head_ori=1.0, arm_ori=1.0,
-                                   damping=BIG, low_accel=0.0, enforce=False))
+                                   damping=BIG, low_accel=0.0, enforce=False,
+                                   base_track_cost=0.0))
     _, ac_lowa, _ = _run(_build_ik(cfg, head_ori=1.0, arm_ori=1.0,
-                                   damping=0.0, low_accel=BIG, enforce=False))
+                                   damping=0.0, low_accel=BIG, enforce=False,
+                                   base_track_cost=0.0))
 
     # (b) damping lowers peak joint speed (generous 0.8x margin; ~0.27x in fact).
     if not (sp_damp.max() < 0.8 * sp_plain.max()):
@@ -650,7 +1227,7 @@ def check_smoothing(cfg, model, data) -> bool:
         return False
 
     # (d) the low-accel task gets its velocity memory each tick + reset clears it.
-    ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0)
+    ik = _build_ik(cfg, head_ori=1.0, arm_ori=1.0, base_track_cost=0.0)
     if ik.low_accel_task is not None:
         _run(ik, n=2)
         if ik.low_accel_task.Delta_q_prev is None:
@@ -1037,8 +1614,17 @@ def main() -> int:
     model, data = loaded
 
     results.append(check_merged_ik(cfg, model, data))
+    results.append(check_solve_guard(cfg, model, data))
     results.append(check_auto_compensation(cfg, model, data))
     results.append(check_whole_body(cfg, model, data))
+    results.append(check_base_deadzone(cfg, model, data))
+    results.append(check_base_axis_split(cfg, model, data))
+    results.append(check_lean_freeze(cfg, model, data))
+    results.append(check_yaw_scheduling(cfg, model, data))
+    results.append(check_trans_scheduling(cfg, model, data))
+    results.append(check_base_follow(cfg, model, data))
+    results.append(check_waist_yaw_follow(cfg, model, data))
+    results.append(check_hand_front(cfg, model, data))
     results.append(check_balance(cfg, model, data))
     results.append(check_limits(cfg, model, data))
     results.append(check_smoothing(cfg, model, data))

@@ -45,12 +45,14 @@ from avp_teleop_upper_body.config import (
     BODY_HOME,
     HEAD_FRAME_BODY,
     CHASSIS_BASE_FRAME,
+    CHASSIS_IK_JOINT,
     TORSO_LEAN_JOINTS,
     NEURAL_WAIST_JOINT,
     NEURAL_PITCH_JOINT,
     CHEST_HEAD_FRAME,
     CHEST_HIP_FRAME,
     CHEST_ANKLE_FRAME,
+    WAIST_LINK_BODY,
     TOOL_BODY,
     all_finger_joints,
     finger_specs,
@@ -110,6 +112,50 @@ def _T(R: np.ndarray, p: np.ndarray) -> np.ndarray:
     T[:3, :3] = R
     T[:3, 3] = p
     return T
+
+
+def _head_world(head_T: np.ndarray, align_R: np.ndarray):
+    """Map a raw AVP head 4x4 into robot world: (position(3), yaw(rad)).
+
+    Position is ``align_R @ p`` (same map wrist_to_tool_target uses for the
+    hands). NOTE: the yaw returned here is from the head's local +Z axis, which
+    is actually near-VERTICAL on the AVP headset (mean|z|~0.98), so it DEGENERATES
+    when looking down -- do NOT use it for a heading. It is only kept for the
+    (default-off) Phase-2 base translation follow, which does not use the yaw.
+    For a pitch-robust turn heading use :func:`_head_interaural_yaw`."""
+    p = align_R @ np.asarray(head_T)[:3, 3]
+    fwd = align_R @ np.asarray(head_T)[:3, 2]      # head local +Z -> world
+    yaw = float(np.arctan2(fwd[1], fwd[0]))
+    return p, yaw
+
+
+def _head_interaural_yaw(head_T: np.ndarray, align_R: np.ndarray) -> float:
+    """Pitch-robust turn heading (rad) from the head's INTERAURAL (left-right)
+    axis. That axis (head local +X) stays horizontal even when the operator
+    looks down -- measured mean|z|=0.03 / min ground-projection 0.99 across the
+    recorded clips incl. the deep squat -- so its ground-plane ``atan2`` never
+    degenerates, unlike the near-vertical gaze axis (which broke Phase 2). Used
+    to drive the waist yaw (Phase 2b): track the head's turn since calibration."""
+    ax = align_R @ np.asarray(head_T)[:3, 0]       # head local +X -> world
+    return float(np.arctan2(ax[1], ax[0]))
+
+
+def _gear_tag(name, frozen, scheduling, damp, static, floor):
+    """Format one mode-switch axis as a P/N/D gear tag for the status line.
+
+    P = frozen (velocityLimit 0). N = unfrozen at static damping (scheduling off,
+    or on but signal below the D threshold). D = scheduling active and damping
+    ramped below static -> show the live damping + a release percentage
+    (0% = just left N / static, 100% = at the floor). ``damp`` is the live cost,
+    ``static``/``floor`` the ramp endpoints. When ``scheduling`` is False the axis
+    tops out at N (no D gear)."""
+    if frozen:
+        return f"{name} P"
+    if not scheduling or damp >= static - 1e-6:
+        return f"{name} N {static:g}"
+    span = static - floor
+    pct = 0.0 if span <= 1e-9 else 100.0 * (static - damp) / span
+    return f"{name} D {damp:.1f}[{pct:.0f}%]"
 
 
 def _set_body_home(model, data, robot: SimRobot, home) -> None:
@@ -321,6 +367,161 @@ def main() -> None:
                              "1=off, smaller=smoother but laggier (default %(default)s).")
     parser.add_argument("--no-filter", action="store_true",
                         help="Disable target pose smoothing (alpha=1.0 on both).")
+    parser.add_argument("--max-target-jump", type=float,
+                        default=cfg.filter.max_translation_jump,
+                        help="Outlier rejection: max per-tick jump (m) of the raw "
+                             "translation target before it is clamped, ahead of "
+                             "the EMA. Rejects corrupt/post-dropout AVP frames "
+                             "that would twitch the robot. 0 = disable "
+                             "(default %(default)s ~= 4.8 m/s).")
+    parser.add_argument("--no-base-deadzone", action="store_true",
+                        help="Disable the mobile-base dead-zone (which freezes "
+                             "the base while the head is not translating, to stop "
+                             "in-place base spin / jitter). On by default.")
+    parser.add_argument("--base-freeze-speed", type=float,
+                        default=cfg.ik.base_freeze_speed,
+                        help="Head horizontal speed (m/s) BELOW which the base is "
+                             "frozen (default %(default)s).")
+    parser.add_argument("--base-unfreeze-speed", type=float,
+                        default=cfg.ik.base_unfreeze_speed,
+                        help="Head horizontal speed (m/s) ABOVE which the base is "
+                             "released; must exceed --base-freeze-speed "
+                             "(hysteresis; default %(default)s).")
+    parser.add_argument("--lean-freeze-speed", type=float,
+                        default=cfg.ik.lean_freeze_speed,
+                        help="Head VERTICAL speed (m/s) BELOW which the trunk lean "
+                             "spine (torso_1/2/3) is frozen -- stops knee jitter "
+                             "when not squatting (default %(default)s).")
+    parser.add_argument("--lean-unfreeze-speed", type=float,
+                        default=cfg.ik.lean_unfreeze_speed,
+                        help="Head VERTICAL speed (m/s) ABOVE which the lean spine "
+                             "is released to track a squat/bend; must exceed "
+                             "--lean-freeze-speed (default %(default)s).")
+    parser.add_argument("--enable-yaw-scheduling", action="store_true",
+                        help="Enable Phase-4 continuous damping scheduling: "
+                             "chassis-yaw damping lowers as combined yaw rate "
+                             "(hands-head + head) rises, making the base cheaper "
+                             "to recruit for a turn instead of contorting arms/waist. "
+                             "Active only when base unfrozen. Off by default "
+                             "(experimental, pending data).")
+    parser.add_argument("--yaw-schedule-floor", type=float,
+                        default=cfg.ik.yaw_schedule_floor,
+                        help="Chassis-yaw damping floor at high combined yaw rate "
+                             "(default %(default)s).")
+    parser.add_argument("--yaw-schedule-rate-low", type=float,
+                        default=cfg.ik.yaw_schedule_rate_low,
+                        help="Combined yaw rate (rad/s) at which static damping applies "
+                             "(default %(default)s).")
+    parser.add_argument("--yaw-schedule-rate-high", type=float,
+                        default=cfg.ik.yaw_schedule_rate_high,
+                        help="Combined yaw rate (rad/s) at which floor damping applies "
+                             "(default %(default)s).")
+    parser.add_argument("--yaw-schedule-alpha", type=float,
+                        default=cfg.ik.yaw_schedule_alpha,
+                        help="EMA alpha for smoothing the damping cost itself (lower "
+                             "= slower, reduces shift shock; default %(default)s).")
+    parser.add_argument("--base-yaw-freeze-rate", type=float,
+                        default=cfg.ik.base_yaw_freeze_rate,
+                        help="Combined yaw rate (rad/s) BELOW which the base yaw "
+                             "freezes (Phase-4b, decoupled from xy; default "
+                             "%(default)s). Only with --enable-yaw-scheduling.")
+    parser.add_argument("--base-yaw-unfreeze-rate", type=float,
+                        default=cfg.ik.base_yaw_unfreeze_rate,
+                        help="Combined yaw rate (rad/s) ABOVE which the base yaw "
+                             "unfreezes to turn in place; must exceed "
+                             "--base-yaw-freeze-rate (default %(default)s).")
+    parser.add_argument("--enable-trans-scheduling", action="store_true",
+                        help="Enable Phase-4b TRANSLATION damping scheduling: base "
+                             "xy damping eases as head horizontal speed rises "
+                             "(gentle; base carries the arms more when walking "
+                             "fast). Off by default.")
+    parser.add_argument("--trans-schedule-floor", type=float,
+                        default=cfg.ik.trans_schedule_floor,
+                        help="Base xy damping floor at high walk speed (default "
+                             "%(default)s; static is --damping-chassis-linear).")
+    parser.add_argument("--trans-schedule-speed-low", type=float,
+                        default=cfg.ik.trans_schedule_speed_low,
+                        help="Head horiz speed (m/s) at which xy damping is still "
+                             "static (N->D boundary; default %(default)s).")
+    parser.add_argument("--trans-schedule-speed-high", type=float,
+                        default=cfg.ik.trans_schedule_speed_high,
+                        help="Head horiz speed (m/s) at which xy damping hits the "
+                             "floor (default %(default)s).")
+    parser.add_argument("--no-base-follow", action="store_true",
+                        help="Disable base-follows-head (Phase 2): the base then "
+                             "only moves reactively via hand-reach error. On by "
+                             "default (drives the base from head walk/turn).")
+    parser.add_argument("--base-follow-scale", type=float,
+                        default=cfg.ik.base_follow_scale,
+                        help="Metres of base motion per metre of head motion "
+                             "(1.0 = 1:1 walking; default %(default)s).")
+    parser.add_argument("--base-track-cost", type=float,
+                        default=cfg.ik.base_track_cost,
+                        help="Weight of the base-tracking task (0 disables; "
+                             "default %(default)s).")
+    parser.add_argument("--waist-yaw-follow", action="store_true",
+                        help="Phase-2b: turn the WAIST (torso_joint_4) with the "
+                             "operator's head interaural yaw, so an in-place twist "
+                             "rotates the waist instead of twisting the arms. "
+                             "Ignored when --egoposer is on (the prior owns the "
+                             "waist). Off by default.")
+    parser.add_argument("--waist-yaw-follow-cost", type=float, default=None,
+                        help="Weight of the waist-yaw-follow task (overrides the "
+                             "default when --waist-yaw-follow is set).")
+    parser.add_argument("--turn-follow-scale", type=float,
+                        default=cfg.ik.turn_follow_scale,
+                        help="Head-yaw -> waist-yaw gain (<1 attenuates; head yaw "
+                             "over-estimates torso twist; default %(default)s).")
+    parser.add_argument("--hand-front", action="store_true",
+                        help="Phase-3: soft guard nudging a hand forward once it "
+                             "goes behind the pelvis, to stop the arms crossing / "
+                             "twisting behind the back on walk/turn. Inert while "
+                             "hands are in front. Off by default.")
+    parser.add_argument("--hand-front-cost", type=float, default=None,
+                        help="Weight of the hand-in-front guard (overrides the "
+                             "default when --hand-front is set).")
+    parser.add_argument("--hand-front-margin", type=float,
+                        default=cfg.ik.hand_front_margin,
+                        help="Guard plane offset (m) behind the hip; negative = "
+                             "behind (default %(default)s, so the natural rest "
+                             "pose is not penalised).")
+    # --- Per-DOF damping (whole-body movement-priority) overrides ------------ #
+    # A higher velocity cost makes the QP move that joint LESS / LATER, so these
+    # set which DOF absorbs a hand motion in the REACTIVE solve (they re-price
+    # existing DOFs, they do NOT add competing target tasks). Cheapest moves
+    # first: arm < waist < neck/lean < chassis. Lower a tier to recruit it sooner
+    # (e.g. --damping-waist 0.2 turns the waist instead of contorting the arms on
+    # an in-place twist; --damping-chassis 12 makes the base carry the arms sooner
+    # on a walk); raise it to keep that joint planted.
+    parser.add_argument("--damping-arm", type=float,
+                        default=cfg.ik.damping_cost_arm,
+                        help="Velocity cost on the 14 arm DOFs (cheapest tier; "
+                             "default %(default)s). Lower = more arm-only reach.")
+    parser.add_argument("--damping-waist", type=float,
+                        default=cfg.ik.damping_cost_waist,
+                        help="Velocity cost on the waist yaw (torso_joint_4; "
+                             "default %(default)s). Lower to turn the WAIST rather "
+                             "than the arms on an in-place twist (json7/8).")
+    parser.add_argument("--damping-neck", type=float,
+                        default=cfg.ik.damping_cost,
+                        help="Velocity cost on the 2 neck DOFs (default "
+                             "%(default)s).")
+    parser.add_argument("--damping-lean", type=float,
+                        default=cfg.ik.damping_cost_lean,
+                        help="Velocity cost on the sagittal lean spine "
+                             "(torso_joint_1/2/3; default %(default)s). Balance is "
+                             "enforced by the balance tasks, not this.")
+    parser.add_argument("--damping-chassis-linear", type=float,
+                        default=cfg.ik.damping_cost_chassis_linear,
+                        help="Velocity cost on the base TRANSLATION x, y (per m/s; "
+                             "default %(default)s). Lower for a more eager base "
+                             "that walks to carry the arms (json9-11); raise to "
+                             "keep it planted for in-reach targets.")
+    parser.add_argument("--damping-chassis-yaw", type=float,
+                        default=cfg.ik.damping_cost_chassis_yaw,
+                        help="Velocity cost on the base YAW / turn (per rad/s; "
+                             "default %(default)s). Lower to let the base TURN to "
+                             "face a target instead of contorting the arms/waist.")
     parser.add_argument("--egoposer", action="store_true",
                         help="Enable the EgoPoser neural trunk-posture prior "
                              "(hallucinates a natural trunk pitch + waist yaw "
@@ -395,9 +596,56 @@ def main() -> None:
     cfg.head_position_scale = args.head_position_scale
     cfg.filter.alpha_translation = args.alpha_translation
     cfg.filter.alpha_rotation = args.alpha_rotation
+    cfg.filter.max_translation_jump = args.max_target_jump
     if args.no_filter:
         cfg.filter.alpha_translation = 1.0
         cfg.filter.alpha_rotation = 1.0
+    # Per-DOF damping overrides (whole-body movement priority). Defaults come from
+    # the config, so these are no-ops unless the user passes a value.
+    cfg.ik.damping_cost_arm = args.damping_arm
+    cfg.ik.damping_cost_waist = args.damping_waist
+    cfg.ik.damping_cost = args.damping_neck
+    cfg.ik.damping_cost_lean = args.damping_lean
+    cfg.ik.damping_cost_chassis_linear = args.damping_chassis_linear
+    cfg.ik.damping_cost_chassis_yaw = args.damping_chassis_yaw
+    if args.no_base_deadzone:
+        cfg.ik.base_deadzone = False
+    cfg.ik.base_freeze_speed = args.base_freeze_speed
+    cfg.ik.base_unfreeze_speed = args.base_unfreeze_speed
+    cfg.ik.lean_freeze_speed = args.lean_freeze_speed
+    cfg.ik.lean_unfreeze_speed = args.lean_unfreeze_speed
+    cfg.ik.enable_yaw_scheduling = args.enable_yaw_scheduling
+    cfg.ik.yaw_schedule_floor = args.yaw_schedule_floor
+    cfg.ik.yaw_schedule_rate_low = args.yaw_schedule_rate_low
+    cfg.ik.yaw_schedule_rate_high = args.yaw_schedule_rate_high
+    cfg.ik.yaw_schedule_alpha = args.yaw_schedule_alpha
+    cfg.ik.base_yaw_freeze_rate = args.base_yaw_freeze_rate
+    cfg.ik.base_yaw_unfreeze_rate = args.base_yaw_unfreeze_rate
+    cfg.ik.enable_trans_scheduling = args.enable_trans_scheduling
+    cfg.ik.trans_schedule_floor = args.trans_schedule_floor
+    cfg.ik.trans_schedule_speed_low = args.trans_schedule_speed_low
+    cfg.ik.trans_schedule_speed_high = args.trans_schedule_speed_high
+    cfg.ik.base_follow_scale = args.base_follow_scale
+    cfg.ik.base_track_cost = 0.0 if args.no_base_follow else args.base_track_cost
+    cfg.ik.turn_follow_scale = args.turn_follow_scale
+    # Waist-yaw follow: on when --waist-yaw-follow (or an explicit cost) is given.
+    # Give it a sensible default cost when enabled but none specified.
+    if args.waist_yaw_follow_cost is not None:
+        cfg.ik.waist_yaw_follow_cost = args.waist_yaw_follow_cost
+    elif args.waist_yaw_follow:
+        if cfg.ik.waist_yaw_follow_cost <= 0.0:
+            cfg.ik.waist_yaw_follow_cost = 2.0
+    else:
+        cfg.ik.waist_yaw_follow_cost = 0.0
+    # Phase-3 hand-in-front guard: on when --hand-front (or explicit cost) given.
+    cfg.ik.hand_front_margin = args.hand_front_margin
+    if args.hand_front_cost is not None:
+        cfg.ik.hand_front_cost = args.hand_front_cost
+    elif args.hand_front:
+        if cfg.ik.hand_front_cost <= 0.0:
+            cfg.ik.hand_front_cost = 5.0
+    else:
+        cfg.ik.hand_front_cost = 0.0
     if args.orientation:
         cfg.retarget.track_orientation = True
     if args.no_orientation:
@@ -507,6 +755,14 @@ def main() -> None:
         enforce_limits=cfg.ik.enforce_limits,
         control_dt=cfg.ik.control_dt,
         solver=cfg.ik.solver,
+        base_joint_name=CHASSIS_IK_JOINT,   # enables the base dead-zone freeze
+        base_track_cost=cfg.ik.base_track_cost,   # Phase-2 base-follows-head
+        waist_yaw_follow_cost=cfg.ik.waist_yaw_follow_cost,  # Phase-2b turn follow
+        waist_joint_name=NEURAL_WAIST_JOINT,      # torso_joint_4
+        hand_front_cost=cfg.ik.hand_front_cost,   # Phase-3 hand-in-front guard
+        hand_front_margin=cfg.ik.hand_front_margin,
+        hand_front_pelvis_frame_name=CHEST_HIP_FRAME,
+        hand_front_waist_frame_name=WAIST_LINK_BODY,
     )
 
     _set_body_home(model, data, body_robot, body_home)
@@ -540,12 +796,26 @@ def main() -> None:
                         "egoposer": bool(cfg.egoposer.enabled),
                         "neural_posture_cost": cfg.ik.neural_posture_cost,
                         "replay_avp": args.replay_avp or None})
+    recording = avp_rec is not None or retarget_rec is not None
     if avp_rec is not None:
-        print(f"[SIM] Recording raw AVP input -> avp_trajectory/{args.record_avp}"
-              f" (press 'q' or close viewer to save).")
+        print(f"[SIM] Recording raw AVP input -> avp_trajectory/{args.record_avp}.json")
     if retarget_rec is not None:
         print(f"[SIM] Recording retarget trace -> "
-              f"retargetting_trajectory/{args.record_retarget}.")
+              f"retargetting_trajectory/{args.record_retarget}.json")
+    if recording:
+        trim = max(0.0, args.record_trim)
+        print("[SIM] ==================== RECORDING GUIDE ====================")
+        print("[SIM]  START : recording begins AUTOMATICALLY now (no key). Every")
+        print("[SIM]          tick is captured, including invalid/no-data ticks.")
+        print("[SIM]  STOP  : close the viewer window, OR press Ctrl+C in this")
+        print("[SIM]          terminal -- BOTH stop AND SAVE the clip. (A second")
+        print("[SIM]          Ctrl+C force-quits without saving.)")
+        print(f"[SIM]  TRIM  : the first & last {trim:g}s are dropped on save "
+              f"(--record-trim,")
+        print("[SIM]          set 0 to keep everything) to cut the start/stop fumble.")
+        print("[SIM]  TIP   : press 'c' to (re)calibrate, space to pause TELEOP")
+        print("[SIM]          (recording of raw AVP input continues while paused).")
+        print("[SIM] =========================================================")
 
     # Raw-AVP input frames overlay: on by request, or automatically while
     # recording AVP (so you can watch the input you're capturing), unless
@@ -614,16 +884,45 @@ def main() -> None:
               "(sphere+RGB triad); thin line to the tool = tracking error. "
               "--no-target-markers to hide.")
     # --- control state mutated by the key callback ---
-    state = {"paused": False, "needs_calib": True}
+    state = {"paused": False, "needs_calib": True, "stop": False}
     calib: Dict[str, Optional[WristCalibration]] = {"head": None, "left": None, "right": None}
     targets: Dict[str, Optional[Target]] = {"head": None, "left": None, "right": None}
     # One smoothing filter per end-effector target (head / left / right). Reset
     # on (re)calibration so we never smooth across the re-anchor discontinuity.
     filters: Dict[str, PoseFilter] = {
-        end: PoseFilter(cfg.filter.alpha_translation, cfg.filter.alpha_rotation)
+        end: PoseFilter(cfg.filter.alpha_translation, cfg.filter.alpha_rotation,
+                        max_translation_jump=cfg.filter.max_translation_jump)
         for end in end_frames
     }
     q_body = body_home.copy()
+
+    # Base dead-zone + follow state.
+    #   speed/prev_xy      : EMA head horizontal speed for the freeze hysteresis.
+    #   head0_xy/head0_z   : head position (robot world) at calibration -- anchor
+    #                        for the walk displacement.
+    #   base0_xy/base0_yaw : chassis pose at calibration -- the base reference the
+    #                        head displacement/yaw is added to.
+    #   prev_hyaw/yaw_accum: previous head yaw + unwrapped cumulative yaw (so a
+    #                        360 deg turn does not wrap at +/-pi).
+    # Start FROZEN (safest at rest); reset on (re)calibration.
+    base_dz = {"prev_xy": None, "speed": 0.0,
+               "head0_xy": None, "head0_z": None, "ref_head_xy": None,
+               "base0_xy": None, "base0_yaw": 0.0,
+               "prev_hyaw": None, "yaw_accum": 0.0,
+               # Phase-2b waist-yaw follow: interaural heading tracking.
+               "iy0": None, "iy_prev": None, "iy_accum": 0.0,
+               # Phase-1b lean dead-zone: head vertical speed for the freeze
+               # hysteresis (prev_z = last raw head world-Z, vspeed = EMA).
+               "prev_z": None, "vspeed": 0.0,
+               # Phase-4b translation scheduling: xy damping EMA.
+               "trans_damp_ema": cfg.ik.damping_cost_chassis_linear,
+               # Phase-4 yaw scheduling: combined yaw rate (hands-head + head) + damping.
+               "yaw_sched": {"head_yaw_prev": None, "hands_yaw_prev": None,
+                             "rate_ema": 0.0, "damp_ema": cfg.ik.damping_cost_chassis_yaw}}
+    if cfg.ik.base_deadzone:
+        ik.set_base_frozen(True)
+    # Lean-spine dead-zone (Phase 1b) also starts FROZEN (stationary at calib).
+    ik.set_lean_frozen(True)
 
     def key_callback(keycode: int) -> None:
         if keycode == 67:      # 'c'
@@ -638,7 +937,9 @@ def main() -> None:
           f"head orientation={'on' if cfg.head_track_orientation else 'off'}")
     print(f"[SIM] Pose filter: alpha_t={cfg.filter.alpha_translation:.2f}, "
           f"alpha_R={cfg.filter.alpha_rotation:.2f} "
-          f"(1.0=off; smaller=smoother)")
+          f"(1.0=off; smaller=smoother); "
+          f"outlier clamp={cfg.filter.max_translation_jump:g} m/tick"
+          f"{' (off)' if cfg.filter.max_translation_jump <= 0 else ''}")
     if cfg.ik.enforce_limits:
         print(f"[SIM] QP rate limits: v_max base_lin={cfg.ik.chassis_max_linear_velocity:.1f} m/s, "
               f"base_yaw={cfg.ik.chassis_max_yaw_velocity:.1f}, "
@@ -651,10 +952,46 @@ def main() -> None:
     print(f"[SIM] Soft smoothing tasks: "
           f"{', '.join(smooth) if smooth else 'none'} "
           f"(damping_cost={cfg.ik.damping_cost:g}, low_accel_cost={cfg.ik.low_accel_cost:g})")
-    print(f"[SIM] Whole-body priority: arm first, then torso/neck/lean, then base "
-          f"(damping: base={cfg.ik.damping_cost_chassis:g} > "
-          f"torso/neck/lean={cfg.ik.damping_cost:g}/{cfg.ik.damping_cost_lean:g} > "
-          f"arm={cfg.ik.damping_cost_arm:g}).")
+    print(f"[SIM] Whole-body priority (damping cost, higher = moves later): "
+          f"arm={cfg.ik.damping_cost_arm:g} < waist={cfg.ik.damping_cost_waist:g} "
+          f"< neck={cfg.ik.damping_cost:g} / lean={cfg.ik.damping_cost_lean:g} "
+          f"< base[xy={cfg.ik.damping_cost_chassis_linear:g}, "
+          f"yaw={cfg.ik.damping_cost_chassis_yaw:g}].")
+    if cfg.ik.base_deadzone:
+        print(f"[SIM] Base dead-zone: ON (freeze base below head speed "
+              f"{cfg.ik.base_freeze_speed:g} m/s, release above "
+              f"{cfg.ik.base_unfreeze_speed:g} m/s). --no-base-deadzone to disable.")
+    else:
+        print("[SIM] Base dead-zone: OFF (base free to move at any head speed).")
+    print(f"[SIM] Lean-spine dead-zone: freeze torso_1/2/3 below head vertical "
+          f"speed {cfg.ik.lean_freeze_speed:g} m/s, release above "
+          f"{cfg.ik.lean_unfreeze_speed:g} m/s (squat detection).")
+    if cfg.ik.enable_yaw_scheduling:
+        print(f"[SIM] Phase-4 yaw scheduling: ON (chassis-yaw damping "
+              f"{cfg.ik.damping_cost_chassis_yaw:g} -> {cfg.ik.yaw_schedule_floor:g} "
+              f"as combined yaw rate (hands-head + head) {cfg.ik.yaw_schedule_rate_low:g} -> "
+              f"{cfg.ik.yaw_schedule_rate_high:g} rad/s; active only when base unfrozen).")
+    if cfg.ik.enable_trans_scheduling:
+        print(f"[SIM] Phase-4b trans scheduling: ON (chassis-xy damping "
+              f"{cfg.ik.damping_cost_chassis_linear:g} -> {cfg.ik.trans_schedule_floor:g} "
+              f"as head horiz speed {cfg.ik.trans_schedule_speed_low:g} -> "
+              f"{cfg.ik.trans_schedule_speed_high:g} m/s; active only when base xy unfrozen).")
+    if cfg.ik.base_track_cost > 0:
+        print(f"[SIM] Base follows head: ON (scale={cfg.ik.base_follow_scale:g}, "
+              f"track cost={cfg.ik.base_track_cost:g}, lean-drop gate="
+              f"{cfg.ik.base_lean_drop:g} m). --no-base-follow to disable.")
+    else:
+        print("[SIM] Base follows head: OFF (base moves only reactively).")
+    if cfg.ik.waist_yaw_follow_cost > 0 and cfg.ik.neural_posture_cost <= 0:
+        print(f"[SIM] Waist yaw follows head: ON (interaural-axis turn, "
+              f"scale={cfg.ik.turn_follow_scale:g}, soft limit "
+              f"±{cfg.ik.waist_soft_limit:g} rad, cost={cfg.ik.waist_yaw_follow_cost:g}).")
+    elif cfg.ik.waist_yaw_follow_cost > 0:
+        print("[SIM] Waist yaw follows head: OFF (EgoPoser owns the waist yaw).")
+    if cfg.ik.hand_front_cost > 0:
+        print(f"[SIM] Hand-in-front guard: ON (cost={cfg.ik.hand_front_cost:g}, "
+              f"plane {cfg.ik.hand_front_margin:g} m behind the hip). "
+              f"--hand-front to toggle.")
     if cfg.ik.chest_over_ankle_cost > 0:
         print(f"[SIM] Balance: chest (head/hip midpoint) kept over the ankle "
               f"(chest_over_ankle_cost={cfg.ik.chest_over_ankle_cost:g}); "
@@ -671,6 +1008,18 @@ def main() -> None:
 
     n_steps_per_frame = max(1, int(round((1.0 / 60.0) / model.opt.timestep)))
 
+    # Ctrl+C sets a stop flag so the loop exits cleanly and the recorder-save
+    # block below still runs (a raw KeyboardInterrupt would skip it and lose the
+    # clip). A second Ctrl+C still hard-kills via the default handler.
+    import signal
+    _prev_sigint = signal.getsignal(signal.SIGINT)
+
+    def _on_sigint(signum, frame):
+        state["stop"] = True
+        signal.signal(signal.SIGINT, _prev_sigint)   # next Ctrl+C = hard kill
+        print("\n[SIM] Ctrl+C: stopping and saving...")
+    signal.signal(signal.SIGINT, _on_sigint)
+
     with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
         # Shadows/reflections/textures are already disabled at the model level in
         # _apply_simple_render (light_castshadow, mat_reflectance, mat_texid); the
@@ -678,7 +1027,7 @@ def main() -> None:
         # viewer Handle does not expose the internal render scene's mjRND_* flags.)
         last_status = time.time()
         frames_seen = 0
-        while viewer.is_running():
+        while viewer.is_running() and not state["stop"]:
             hands, head = sub.poll()
             # Stop at the end of a (non-looping) replayed clip.
             if isinstance(sub, FileAvpSource) and sub.done:
@@ -712,6 +1061,50 @@ def main() -> None:
                 got = [e for e in end_frames if calib[e] is not None]
                 q_body = body_robot.get_arm_qpos()
                 state["needs_calib"] = False
+                # Reset the base dead-zone: forget head-speed history and start
+                # frozen (the operator is stationary at the calibration instant).
+                base_dz["prev_xy"] = None
+                base_dz["speed"] = 0.0
+                base_dz["trans_damp_ema"] = cfg.ik.damping_cost_chassis_linear
+                if cfg.ik.base_deadzone:
+                    ik.set_base_frozen(True)
+                # Reset the lean dead-zone (Phase 1b): forget the vertical-speed
+                # history and start frozen (stationary at calibration).
+                base_dz["prev_z"] = None
+                base_dz["vspeed"] = 0.0
+                ik.set_lean_frozen(True)
+                # Reset the Phase-4 yaw scheduler: forget yaw-rate history and
+                # reset damping EMA to the static value (so it doesn't carry stale
+                # low values into the next unfreeze).
+                base_dz["yaw_sched"]["head_yaw_prev"] = None
+                base_dz["yaw_sched"]["hands_yaw_prev"] = None
+                base_dz["yaw_sched"]["rate_ema"] = 0.0
+                base_dz["yaw_sched"]["damp_ema"] = cfg.ik.damping_cost_chassis_yaw
+                # Anchor the Phase-2 base-follow: head pose (robot world) + the
+                # base pose at calibration are the references head displacement /
+                # yaw are added to. yaw_accum unwraps the head heading over time.
+                base_dz["head0_xy"] = None
+                base_dz["base0_xy"] = q_body[:2].copy()
+                base_dz["base0_yaw"] = float(q_body[2])
+                base_dz["prev_hyaw"] = None
+                base_dz["yaw_accum"] = 0.0
+                base_dz["iy0"] = None
+                base_dz["iy_prev"] = None
+                base_dz["iy_accum"] = 0.0
+                if live["head"] is not None:
+                    hp, hyaw = _head_world(live["head"], align_R_mat)
+                    base_dz["head0_xy"] = hp[:2].copy()
+                    base_dz["head0_z"] = float(hp[2])
+                    base_dz["ref_head_xy"] = hp[:2].copy()
+                    base_dz["prev_hyaw"] = hyaw
+                    iy = _head_interaural_yaw(live["head"], align_R_mat)
+                    base_dz["iy0"] = iy
+                    base_dz["iy_prev"] = iy
+                if ik.base_task is not None:
+                    ik.set_base_target(base_dz["base0_xy"][0], base_dz["base0_xy"][1],
+                                       base_dz["base0_yaw"])
+                if ik.waist_task is not None:
+                    ik.set_waist_yaw_target(0.0)
                 print(f"[SIM] Calibrated: {', '.join(got) if got else '(none yet)'}.")
 
             # Update targets from fresh frames (per-end scale / orientation),
@@ -757,6 +1150,191 @@ def main() -> None:
                     ik.set_neural_target(neural_prior["pitch"], neural_prior["yaw"])
                     if visualize_prior and prior.skeleton is not None:
                         prior_skeleton["pts"] = prior.skeleton
+
+            # --- Base dead-zone: freeze the mobile base while the operator's
+            # head is not translating horizontally, release it once they walk.
+            # Uses the RAW AVP head xy (horizontal only, so a pure squat/bend
+            # does not release the base). EMA-smoothed speed + hysteresis
+            # (freeze below base_freeze_speed, release above base_unfreeze_speed)
+            # so it does not chatter. Head missing this tick -> hold last state.
+            if cfg.ik.base_deadzone and live["head"] is not None:
+                head_xy = np.asarray(live["head"])[:2, 3]
+                if base_dz["prev_xy"] is not None:
+                    inst = float(np.linalg.norm(head_xy - base_dz["prev_xy"])) / (1.0 / 60.0)
+                    a = cfg.ik.base_speed_alpha
+                    base_dz["speed"] += a * (inst - base_dz["speed"])
+                base_dz["prev_xy"] = head_xy.copy()
+                # Phase-4b: this gates the base TRANSLATION (xy) only. Base yaw
+                # has its own gate below (combined yaw rate) when scheduling is on;
+                # otherwise yaw mirrors xy for byte-identical pre-4b behaviour.
+                if ik.base_xy_frozen and base_dz["speed"] > cfg.ik.base_unfreeze_speed:
+                    ik.set_base_xy_frozen(False)
+                elif not ik.base_xy_frozen and base_dz["speed"] < cfg.ik.base_freeze_speed:
+                    ik.set_base_xy_frozen(True)
+
+                # Phase-4b TRANSLATION scheduling (D gear): once unfrozen, ease
+                # the xy damping from static (damping_cost_chassis_linear) toward
+                # trans_schedule_floor as head horizontal speed rises, so the base
+                # carries the arms more eagerly when walking fast. Gentle by
+                # design. EMA-smoothed to avoid shift shock. Only when enabled and
+                # xy unfrozen (else static value / frozen dominates).
+                if cfg.ik.enable_trans_scheduling and not ik.base_xy_frozen:
+                    target_xy_damp = float(np.interp(
+                        base_dz["speed"],
+                        [cfg.ik.trans_schedule_speed_low, cfg.ik.trans_schedule_speed_high],
+                        [cfg.ik.damping_cost_chassis_linear, cfg.ik.trans_schedule_floor]))
+                    base_dz["trans_damp_ema"] += cfg.ik.base_speed_alpha * (
+                        target_xy_damp - base_dz["trans_damp_ema"])
+                    ik.set_chassis_xy_damping(base_dz["trans_damp_ema"])
+                elif cfg.ik.enable_trans_scheduling:
+                    # xy frozen: reset the damping EMA to the static value.
+                    base_dz["trans_damp_ema"] = cfg.ik.damping_cost_chassis_linear
+
+            # --- Lean-spine dead-zone (Phase 1b): freeze the sagittal lean spine
+            # (torso_joint_1/2/3) while the operator is NOT squatting/bending, so
+            # the knees/ankles stop jittering during stationary fine manipulation
+            # (json1-3). Gate on head VERTICAL speed (squat detection) -- raw AVP
+            # head world-Z (align_R is a yaw, so Z is unchanged), EMA-smoothed,
+            # with hysteresis (freeze below lean_freeze_speed, release above
+            # lean_unfreeze_speed). Orthogonal to the base's horizontal gate.
+            # Head missing this tick -> hold last state.
+            if live["head"] is not None:
+                head_z = float(np.asarray(live["head"])[2, 3])
+                if base_dz["prev_z"] is not None:
+                    inst = abs(head_z - base_dz["prev_z"]) / (1.0 / 60.0)
+                    a = cfg.ik.base_speed_alpha
+                    base_dz["vspeed"] += a * (inst - base_dz["vspeed"])
+                base_dz["prev_z"] = head_z
+                if ik.lean_frozen and base_dz["vspeed"] > cfg.ik.lean_unfreeze_speed:
+                    ik.set_lean_frozen(False)
+                elif not ik.lean_frozen and base_dz["vspeed"] < cfg.ik.lean_freeze_speed:
+                    ik.set_lean_frozen(True)
+
+            # --- Phase-4 continuous damping scheduling: chassis-yaw damping lowers
+            # as COMBINED yaw rate rises (hands-head yaw rate + head yaw rate),
+            # making the base cheaper to recruit for a turn (instead of contorting
+            # arms/waist). The combined signal captures both "turn waist" (hands
+            # sweep around body, head static as in clip7/8) and "turn body" (head +
+            # hands both turn as in clip11). Active ONLY when the base is unfrozen
+            # (the dead-zone handles stationary). Damping cost itself is EMA-smoothed
+            # to avoid QP objective discontinuities ("shift shock" / 换挡冲击).
+            if cfg.ik.enable_yaw_scheduling and live["head"] is not None:
+                # 1. Head yaw rate (interaural, pitch-robust).
+                head_yaw = _head_interaural_yaw(live["head"], align_R_mat)
+                head_yaw_rate = 0.0
+                if base_dz["yaw_sched"]["head_yaw_prev"] is not None:
+                    d_head = (head_yaw - base_dz["yaw_sched"]["head_yaw_prev"] + np.pi) % (2*np.pi) - np.pi
+                    head_yaw_rate = abs(d_head) / (1.0 / 60.0)
+                base_dz["yaw_sched"]["head_yaw_prev"] = head_yaw
+
+                # 2. Hands-head yaw rate: yaw angle of (hands_midpoint - head) vector.
+                hands_yaw_rate = 0.0
+                if live["left"] is not None and live["right"] is not None:
+                    hands_mid_xy = 0.5 * (np.asarray(live["left"])[:2, 3] + np.asarray(live["right"])[:2, 3])
+                    head_xy = np.asarray(live["head"])[:2, 3]
+                    vec = hands_mid_xy - head_xy
+                    dist = float(np.linalg.norm(vec))
+                    if dist > 0.25:  # Hands far enough from head for stable yaw angle.
+                        hands_yaw = float(np.arctan2(vec[1], vec[0]))
+                        if base_dz["yaw_sched"]["hands_yaw_prev"] is not None:
+                            d_hands = (hands_yaw - base_dz["yaw_sched"]["hands_yaw_prev"] + np.pi) % (2*np.pi) - np.pi
+                            hands_yaw_rate = abs(d_hands) / (1.0 / 60.0)
+                        base_dz["yaw_sched"]["hands_yaw_prev"] = hands_yaw
+                    else:
+                        base_dz["yaw_sched"]["hands_yaw_prev"] = None  # Too close, reset.
+
+                # 3. Combined signal: total turning intent strength.
+                combined_rate = head_yaw_rate + hands_yaw_rate
+                a = cfg.ik.yaw_schedule_alpha
+                base_dz["yaw_sched"]["rate_ema"] += a * (combined_rate - base_dz["yaw_sched"]["rate_ema"])
+                r = base_dz["yaw_sched"]["rate_ema"]
+
+                # 4a. Phase-4b independent base-YAW dead-zone: gate the base yaw
+                # freeze on the combined yaw rate (hysteresis), DECOUPLED from the
+                # xy dead-zone above. So an in-place turn (low translation, high
+                # yaw rate) releases the base yaw even while xy stays frozen
+                # (fixes clip11). Only when base_deadzone is on.
+                if cfg.ik.base_deadzone:
+                    if ik.base_yaw_frozen and r > cfg.ik.base_yaw_unfreeze_rate:
+                        ik.set_base_yaw_frozen(False)
+                    elif not ik.base_yaw_frozen and r < cfg.ik.base_yaw_freeze_rate:
+                        ik.set_base_yaw_frozen(True)
+
+                # 4b. Map combined rate -> damping (only when base yaw unfrozen).
+                if not ik.base_yaw_frozen:
+                    target_damp = float(np.interp(
+                        r,
+                        [cfg.ik.yaw_schedule_rate_low, cfg.ik.yaw_schedule_rate_high],
+                        [cfg.ik.damping_cost_chassis_yaw, cfg.ik.yaw_schedule_floor]
+                    ))
+                    # Smooth the damping cost itself (EMA) to avoid QP jumps.
+                    base_dz["yaw_sched"]["damp_ema"] += a * (target_damp - base_dz["yaw_sched"]["damp_ema"])
+                    ik.set_chassis_yaw_damping(base_dz["yaw_sched"]["damp_ema"])
+                else:
+                    # Frozen: reset the damping EMA to the static value so it doesn't
+                    # carry stale low values into the next unfreeze.
+                    base_dz["yaw_sched"]["damp_ema"] = cfg.ik.damping_cost_chassis_yaw
+            elif cfg.ik.base_deadzone:
+                # Scheduling OFF: base yaw mirrors the xy freeze (byte-identical
+                # to the pre-4b behaviour -- the whole base freezes/thaws together).
+                if ik.base_yaw_frozen != ik.base_xy_frozen:
+                    ik.set_base_yaw_frozen(ik.base_xy_frozen)
+
+            # --- Phase 2: base follows head. Drive the chassis reference from
+            # the operator's head horizontal displacement (walk) + head yaw
+            # (turn) since calibration, both in robot world. The base task then
+            # carries the arms along instead of the arms twisting to reach.
+            # xy is LEAN-GATED (a forward bend drops the head -> hold xy, only a
+            # near-level step advances it); yaw is unwrapped so a 360 deg turn
+            # tracks continuously. While the base is frozen (head not walking)
+            # the hard velocity limit pins it regardless, and an in-place torso
+            # twist stays frozen -> handled by the waist/arms (json7/8).
+            if ik.base_task is not None and live["head"] is not None:
+                hp, hyaw = _head_world(live["head"], align_R_mat)
+                # Lazy anchor if the head was absent at calibration.
+                if base_dz["head0_xy"] is None:
+                    base_dz["head0_xy"] = hp[:2].copy()
+                    base_dz["head0_z"] = float(hp[2])
+                    base_dz["ref_head_xy"] = hp[:2].copy()
+                    base_dz["base0_xy"] = q_body[:2].copy()
+                    base_dz["base0_yaw"] = float(q_body[2])
+                    base_dz["prev_hyaw"] = hyaw
+                # Advance the xy reference only when the head is near its
+                # calibration height (a step, not a bend).
+                if abs(hp[2] - base_dz["head0_z"]) <= cfg.ik.base_lean_drop:
+                    base_dz["ref_head_xy"] = hp[:2].copy()
+                # Unwrap head yaw into a continuous heading.
+                if base_dz["prev_hyaw"] is not None:
+                    d = (hyaw - base_dz["prev_hyaw"] + np.pi) % (2 * np.pi) - np.pi
+                    base_dz["yaw_accum"] += d
+                base_dz["prev_hyaw"] = hyaw
+                s = cfg.ik.base_follow_scale
+                dxy = s * (base_dz["ref_head_xy"] - base_dz["head0_xy"])
+                tx = base_dz["base0_xy"][0] + dxy[0]
+                ty = base_dz["base0_xy"][1] + dxy[1]
+                tyaw = base_dz["base0_yaw"] + base_dz["yaw_accum"]
+                ik.set_base_target(tx, ty, tyaw)
+
+            # --- Phase 2b: waist yaw follows the operator's turn. Drive
+            # torso_joint_4 toward the head INTERAURAL-axis yaw since calibration
+            # (pitch-robust -- stable when looking down, see _head_interaural_yaw),
+            # unwrapped and scaled, clamped to a soft limit below the joint's hard
+            # +/-1.53 rad. So an in-place twist turns the waist instead of twisting
+            # the arms. Only active when the waist task exists (waist_yaw_follow_cost
+            # > 0 AND EgoPoser off -- EgoPoser owns the waist otherwise).
+            if ik.waist_task is not None and live["head"] is not None:
+                iy = _head_interaural_yaw(live["head"], align_R_mat)
+                if base_dz["iy0"] is None:                 # lazy anchor
+                    base_dz["iy0"] = iy
+                    base_dz["iy_prev"] = iy
+                # Unwrap into a continuous accumulated turn since calibration.
+                d = (iy - base_dz["iy_prev"] + np.pi) % (2 * np.pi) - np.pi
+                base_dz["iy_accum"] += d
+                base_dz["iy_prev"] = iy
+                tgt = cfg.ik.turn_follow_scale * base_dz["iy_accum"]
+                tgt = float(np.clip(tgt, -cfg.ik.waist_soft_limit,
+                                    cfg.ik.waist_soft_limit))
+                ik.set_waist_yaw_target(tgt)
 
             finger_cmd: Dict[str, Dict[str, float]] = {}
             if not state["paused"] and calibrated:
@@ -834,13 +1412,27 @@ def main() -> None:
             now = time.time()
             if now - last_status >= 2.0:
                 rate = frames_seen / (now - last_status)
+                base_tag = ""
+                if cfg.ik.base_deadzone:
+                    # Three orthogonal mode-switch axes as P/N/D gears.
+                    trans = _gear_tag(
+                        "base_trans", ik.base_xy_frozen,
+                        cfg.ik.enable_trans_scheduling, ik.chassis_xy_damping,
+                        cfg.ik.damping_cost_chassis_linear, cfg.ik.trans_schedule_floor)
+                    yaw = _gear_tag(
+                        "base_yaw", ik.base_yaw_frozen,
+                        cfg.ik.enable_yaw_scheduling, ik.chassis_yaw_damping,
+                        cfg.ik.damping_cost_chassis_yaw, cfg.ik.yaw_schedule_floor)
+                    # body_pitch (lean spine) has no damping schedule -> P/N only.
+                    pitch = f"body_pitch {'P' if ik.lean_frozen else 'N'}"
+                    base_tag = f" | {trans} | {yaw} | {pitch}"
                 if isinstance(sub, FileAvpSource):
                     i, n = sub.progress
-                    print(f"[SIM] replaying | frame {i}/{n} | {rate:.0f}/s",
+                    print(f"[SIM] replaying | frame {i}/{n} | {rate:.0f}/s{base_tag}",
                           end="\r", flush=True)
                 else:
                     tag = "tracking" if frames_seen else "NO DATA (is the publisher running?)"
-                    print(f"[SIM] {tag} | frames {rate:.0f}/s", end="\r", flush=True)
+                    print(f"[SIM] {tag} | frames {rate:.0f}/s{base_tag}", end="\r", flush=True)
                 frames_seen, last_status = 0, now
 
             time.sleep(max(0.0, 1.0 / 60.0 - 0.001))

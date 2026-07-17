@@ -160,6 +160,109 @@ class TrunkUprightTask(Task):
         return f"TrunkUprightTask(cost={self.cost})"
 
 
+class BaseTrackingTask(Task):
+    r"""Drive the mobile base (chassis x / y / yaw) toward a commanded target.
+
+    Phase-2 "base follows head": instead of letting the QP recruit the base only
+    reactively (when a hand FrameTask error beats the chassis damping -- which on
+    a big walk/turn makes the arms twist to reach instead of the base driving
+    there), this task pulls the 3 chassis DOFs toward a per-tick reference
+    ``(x, y, yaw)`` derived in sim_teleop from the operator's head horizontal
+    displacement (walk intent) and head yaw (turn intent). The base then carries
+    the arms along, so the hands stay natural.
+
+    Error is the 3-vector ``q[chassis] - target`` (the yaw row wrapped to
+    ``(-pi, pi]`` so a target across the +/-pi seam -- e.g. a 360 deg turn --
+    does not spin the wrong way), with a CONSTANT identity Jacobian on the three
+    chassis tangent DOFs. It references ONLY the chassis joint angles, so it
+    touches no other DOF directly (the arms re-solve around wherever the base
+    goes via their own FrameTasks).
+
+    Composes with the Phase-1 dead-zone: when the base is frozen
+    (``set_base_frozen(True)`` zeroes the chassis velocityLimit) the QP holds
+    chassis Delta_q = 0, so this task's error is absorbed by that hard velocity
+    constraint inside the (blocked) chassis subspace and cannot leak into the
+    arms. sim_teleop additionally holds the target at the current base while
+    frozen, so the error is ~0 anyway. Cost is set above the chassis DampingTask
+    (so it actually moves the base) but below the hand FrameTasks (so grasp
+    precision still wins a genuine conflict); 0 disables (task not built).
+    """
+
+    def __init__(self, chassis_v_index, chassis_q_index, cost,
+                 gain=1.0, lm_damping=0.0):
+        super().__init__(cost=cost, gain=gain, lm_damping=lm_damping)
+        self.chassis_v_index = list(chassis_v_index)   # [x, y, yaw] tangent idx
+        self.chassis_q_index = list(chassis_q_index)   # [x, y, yaw] qpos idx
+        self.target = np.zeros(3)                      # x (m), y (m), yaw (rad)
+
+    def set_target(self, x: float, y: float, yaw: float) -> None:
+        self.target = np.array([float(x), float(y), float(yaw)])
+
+    def compute_error(self, configuration: pink.Configuration) -> np.ndarray:
+        q = configuration.q
+        cur = np.array([q[i] for i in self.chassis_q_index])
+        e = cur - self.target
+        # Wrap the yaw error into (-pi, pi] so the base turns the short way.
+        e[2] = (e[2] + np.pi) % (2.0 * np.pi) - np.pi
+        return e
+
+    def compute_jacobian(self, configuration: pink.Configuration) -> np.ndarray:
+        J = np.zeros((3, configuration.model.nv))
+        for row, iv in enumerate(self.chassis_v_index):
+            J[row, iv] = 1.0
+        return J
+
+    def __repr__(self) -> str:
+        return (f"BaseTrackingTask(cost={self.cost}, "
+                f"target={np.round(self.target, 3)})")
+
+
+class WaistYawTask(Task):
+    r"""Drive the waist yaw (torso_joint_4) toward a commanded angle.
+
+    Phase-2b "turn follows head": on an in-place torso twist the operator's head
+    yaws but does not translate, so the Phase-1 dead-zone keeps the base frozen
+    and the arms would otherwise twist to reach the swept hand targets (json7/8).
+    This task turns the WAIST with the operator instead -- it pulls torso_joint_4
+    toward a per-tick target that sim_teleop computes from the head's interaural
+    (left-right) axis yaw since calibration (pitch-robust: that axis stays
+    horizontal even when looking down, unlike the gaze axis).
+
+    Single-DOF: error ``q[waist] - target`` (yaw-wrapped to (-pi, pi]) with a
+    constant Jacobian (one 1.0 on the waist tangent DOF) -- same shape as the
+    waist row of :class:`NeuralPostureTask`. The waist has a hard joint limit
+    (+/-1.53 rad); sim_teleop clamps the target to a soft limit below that.
+
+    MUTUALLY EXCLUSIVE with NeuralPostureTask on the waist: both would target
+    torso_joint_4. WholeBodyIK builds this ONLY when neural_posture_cost <= 0
+    (EgoPoser off); when EgoPoser is on its NeuralPostureTask owns the waist (it
+    has the cleaner SMPL body-twist signal). Cost 0 disables (task not built).
+    """
+
+    def __init__(self, waist_v_index, waist_q_index, cost,
+                 gain=1.0, lm_damping=0.0):
+        super().__init__(cost=cost, gain=gain, lm_damping=lm_damping)
+        self.waist_v_index = int(waist_v_index)
+        self.waist_q_index = int(waist_q_index)
+        self.yaw_target = 0.0
+
+    def set_target(self, yaw: float) -> None:
+        self.yaw_target = float(yaw)
+
+    def compute_error(self, configuration: pink.Configuration) -> np.ndarray:
+        e = configuration.q[self.waist_q_index] - self.yaw_target
+        e = (e + np.pi) % (2.0 * np.pi) - np.pi
+        return np.array([e])
+
+    def compute_jacobian(self, configuration: pink.Configuration) -> np.ndarray:
+        J = np.zeros((1, configuration.model.nv))
+        J[0, self.waist_v_index] = 1.0
+        return J
+
+    def __repr__(self) -> str:
+        return f"WaistYawTask(cost={self.cost}, target={self.yaw_target:.3f})"
+
+
 class NeuralPostureTask(Task):
     r"""Track a neural (EgoPoser) trunk-posture prior at low cost.
 
@@ -313,6 +416,75 @@ class ChestOverAnkleTask(Task):
         return f"ChestOverAnkleTask(cost={self.cost})"
 
 
+class HandFrontTask(Task):
+    r"""Soft ONE-SIDED guard: keep each hand IN FRONT of the pelvis.
+
+    On big walk/turn motions the arms can end up reaching / crossing BEHIND the
+    robot (json9-11: "arms twist crossed behind the back"). This task nudges a
+    hand forward, but ONLY once it goes behind a margin plane anchored at the
+    pelvis and facing the robot's forward -- so it is completely INERT whenever
+    the hands are in front (the common case), unlike a two-sided FrameTask or the
+    head-driven follow tasks (which impose a target every tick and compete with
+    the hand FrameTasks). It is a null-space bias, deliberately kept BELOW the
+    hand FrameTask cost, so a genuine reach-behind still wins -- it only prefers
+    "turn to face the target" over "reach behind" when both track equally.
+
+    Geometry (per hand, base-invariant -- both operands ride with the base):
+        forward = waist_link local +X in world (robot heading; world -Y at
+                  neutral), taken as a constant plane normal for this tick
+        s = (p_hand - p_pelvis) . forward         # signed forward offset (m)
+        error_i = min(0, s - margin)              # 0 when in front of the margin
+    A NEGATIVE margin places the plane slightly BEHIND the hip, so the natural
+    rest pose (hands a few cm behind the hip joint) is not penalised; only a
+    gross reach-behind is. The Jacobian row is ``forward . (J_hand - J_pelvis)``
+    when active, else 0 (the task drops out of the QP for that hand).
+    """
+
+    def __init__(self, left_id, right_id, pelvis_id, waist_id, cost,
+                 margin=-0.15, gain=1.0, lm_damping=0.0):
+        super().__init__(cost=cost, gain=gain, lm_damping=lm_damping)
+        self.left_id = left_id
+        self.right_id = right_id
+        self.pelvis_id = pelvis_id
+        self.waist_id = waist_id
+        self.margin = float(margin)
+
+    def _p(self, configuration, fid):
+        return configuration.data.oMf[fid].translation
+
+    def _Jw(self, configuration, fid):
+        return pin.getFrameJacobian(
+            configuration.model, configuration.data, fid,
+            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)[:3]
+
+    def _forward(self, configuration) -> np.ndarray:
+        # Robot forward = waist link local +X in world (see _prior_anchor_pose).
+        return configuration.data.oMf[self.waist_id].rotation[:, 0].copy()
+
+    def compute_error(self, configuration: pink.Configuration) -> np.ndarray:
+        fwd = self._forward(configuration)
+        pelvis = self._p(configuration, self.pelvis_id)
+        e = np.zeros(2)
+        for row, fid in enumerate((self.left_id, self.right_id)):
+            s = float(np.dot(self._p(configuration, fid) - pelvis, fwd))
+            e[row] = min(0.0, s - self.margin)     # one-sided: 0 when in front
+        return e
+
+    def compute_jacobian(self, configuration: pink.Configuration) -> np.ndarray:
+        fwd = self._forward(configuration)
+        pelvis = self._p(configuration, self.pelvis_id)
+        Jp = self._Jw(configuration, self.pelvis_id)
+        J = np.zeros((2, configuration.model.nv))
+        for row, fid in enumerate((self.left_id, self.right_id)):
+            s = float(np.dot(self._p(configuration, fid) - pelvis, fwd))
+            if s - self.margin < 0.0:              # active only when behind
+                J[row] = fwd @ (self._Jw(configuration, fid) - Jp)
+        return J
+
+    def __repr__(self) -> str:
+        return f"HandFrontTask(cost={self.cost}, margin={self.margin})"
+
+
 def _flatten_mjcf(mjcf_path: str) -> str:
     """Resolve all <include>s into a single self-contained XML on disk.
 
@@ -368,6 +540,14 @@ class WholeBodyIK:
         control_dt: float = 1.0 / 60.0,
         solver: str = "quadprog",
         max_joint_step: np.ndarray | float | None = None,
+        base_joint_name: Optional[str] = None,
+        base_track_cost: float = 0.0,
+        waist_yaw_follow_cost: float = 0.0,
+        waist_joint_name: Optional[str] = None,
+        hand_front_cost: float = 0.0,
+        hand_front_margin: float = -0.15,
+        hand_front_pelvis_frame_name: Optional[str] = None,
+        hand_front_waist_frame_name: Optional[str] = None,
     ):
         self.head_frame_name = head_frame_name
         self.left_tool_name = left_tool_name
@@ -455,6 +635,58 @@ class WholeBodyIK:
             v_tan[iv] = vmax
             a_tan[iv] = amax
         self.model.velocityLimit = v_tan
+        # Kept for the Phase-0 output guard in solve(): a full-tangent per-DOF
+        # velocity cap (inf on the locked DOFs) to clamp a degenerate QP result
+        # before it is integrated (see solve()).
+        self._v_tan = v_tan.copy()
+
+        # --- mobile-base live freeze (Phase 1 base dead-zone) ---------------- #
+        # Resolve the tangent DOFs of the mobile base so set_base_frozen() can
+        # pin them inside the QP by zeroing their velocity limit for a tick.
+        # base_joint_name is the reduced-model composite base joint
+        # (CHASSIS_IK_JOINT); if omitted, the freeze API is inert. Pink's
+        # VelocityLimit reads model.velocityLimit live each solve, so toggling
+        # these entries takes effect on the very next solve() without rebuilding
+        # anything. We also mirror the change into _v_tan so the Phase-0 output
+        # clamp stays consistent (frozen DOFs clamp to 0).
+        self._base_v_index: List[int] = []
+        self._base_q_index: List[int] = []
+        self._base_v_cap: np.ndarray = np.zeros(0)
+        # Phase-4b: xy (translation) and yaw (turn) freeze independently, driven
+        # by orthogonal intent signals (head horizontal speed vs combined yaw
+        # rate). Two separate state bits; set_base_frozen() sets both at once
+        # (backward-compatible convenience).
+        self._base_xy_frozen = False
+        self._base_yaw_frozen = False
+        if base_joint_name is not None:
+            if not self.model.existJointName(base_joint_name):
+                raise ValueError(f"Base joint '{base_joint_name}' not in model.")
+            bjid = self.model.getJointId(base_joint_name)
+            biv, bnv = self.model.idx_vs[bjid], self.model.nvs[bjid]
+            biq, bnq = self.model.idx_qs[bjid], self.model.nqs[bjid]
+            self._base_v_index = list(range(biv, biv + bnv))
+            self._base_q_index = list(range(biq, biq + bnq))
+            self._base_v_cap = self.model.velocityLimit[self._base_v_index].copy()
+
+        # Resolve the tangent DOFs of the trunk lean spine (torso_joint_1/2/3:
+        # ankle/knee/hip pitch) so set_lean_frozen() can pin them -- Phase-1b
+        # dead-zone, gated on head vertical speed (squat detection) in sim_teleop.
+        # Same pattern as the base freeze above. Uses the already-passed
+        # trunk_lean_joint_names (also used by TrunkUprightTask).
+        self._lean_v_index: List[int] = []
+        self._lean_v_cap: np.ndarray = np.zeros(0)
+        self._lean_frozen = False
+        if trunk_lean_joint_names:
+            lean_v = []
+            for nm in trunk_lean_joint_names:
+                if not self.model.existJointName(nm):
+                    raise ValueError(f"Lean joint '{nm}' not in model.")
+                jid = self.model.getJointId(nm)
+                iv, nv = self.model.idx_vs[jid], self.model.nvs[jid]
+                lean_v.extend(range(iv, iv + nv))
+            self._lean_v_index = lean_v
+            self._lean_v_cap = self.model.velocityLimit[self._lean_v_index].copy()
+
         self.config_limit = ConfigurationLimit(self.model, config_limit_gain=config_limit_gain)
         self.velocity_limit = VelocityLimit(self.model)
         self.acceleration_limit = AccelerationLimit(self.model, a_tan)
@@ -631,10 +863,67 @@ class WholeBodyIK:
                 int(self.model.idx_vs[wjid]), int(self.model.idx_qs[wjid]),
                 cost=neural_posture_cost)
 
+        # Phase-2 base-tracking task: drive chassis x/y/yaw toward a per-tick
+        # target set from the operator's head displacement/yaw (see
+        # set_base_target). Built only when base_track_cost > 0 and the base
+        # joint DOFs were resolved (base_joint_name given); otherwise inert, so
+        # the pipeline is byte-identical to the pre-Phase-2 behaviour.
+        self.base_task = None
+        if base_track_cost > 0:
+            if not self._base_v_index:
+                raise ValueError(
+                    "base_track_cost > 0 requires base_joint_name (the composite "
+                    "chassis joint whose x/y/yaw DOFs the task drives).")
+            self.base_task = BaseTrackingTask(
+                self._base_v_index, self._base_q_index, cost=base_track_cost)
+
+        # Phase-2b waist-yaw follow: drive torso_joint_4 toward a per-tick target
+        # (set from the head interaural yaw in sim_teleop). Built ONLY when
+        # waist_yaw_follow_cost > 0 AND the neural prior is off -- the
+        # NeuralPostureTask already owns the waist when EgoPoser is enabled, so
+        # the two must not both target torso_joint_4 (mutual exclusion).
+        self.waist_task = None
+        if waist_yaw_follow_cost > 0 and neural_posture_cost <= 0:
+            if not waist_joint_name:
+                raise ValueError(
+                    "waist_yaw_follow_cost > 0 requires waist_joint_name "
+                    "(the waist-yaw joint, e.g. torso_joint_4).")
+            if not self.model.existJointName(waist_joint_name):
+                raise ValueError(f"Waist joint '{waist_joint_name}' not in model.")
+            wjid = self.model.getJointId(waist_joint_name)
+            self.waist_task = WaistYawTask(
+                int(self.model.idx_vs[wjid]), int(self.model.idx_qs[wjid]),
+                cost=waist_yaw_follow_cost)
+
+        # Phase-3 hand-in-front soft guard: one-sided penalty nudging a hand
+        # forward once it goes behind a pelvis-anchored margin plane (see
+        # HandFrontTask). Uses the two tool frames + the hip (pelvis) frame + the
+        # waist link (for the forward heading). Built only when hand_front_cost>0.
+        self.hand_front_task = None
+        if hand_front_cost > 0:
+            pf = hand_front_pelvis_frame_name
+            wf = hand_front_waist_frame_name
+            if not pf or not wf:
+                raise ValueError(
+                    "hand_front_cost > 0 requires hand_front_pelvis_frame_name "
+                    "and hand_front_waist_frame_name.")
+            for role, nm in (("pelvis", pf), ("waist", wf),
+                             ("left tool", left_tool_name),
+                             ("right tool", right_tool_name)):
+                if not self.model.existFrame(nm):
+                    raise ValueError(f"Hand-front {role} frame '{nm}' not in model.")
+            self.hand_front_task = HandFrontTask(
+                self.model.getFrameId(left_tool_name),
+                self.model.getFrameId(right_tool_name),
+                self.model.getFrameId(pf), self.model.getFrameId(wf),
+                cost=hand_front_cost, margin=hand_front_margin)
+
         self._tasks = [self.head_task, self.left_task, self.right_task,
                        self.posture_task]
         for task in (self.com_task, self.chest_task, self.trunk_task,
-                     self.neural_task, self.damping_task, self.low_accel_task):
+                     self.neural_task, self.base_task, self.waist_task,
+                     self.hand_front_task,
+                     self.damping_task, self.low_accel_task):
             if task is not None:
                 self._tasks.append(task)
         self._frames = {
@@ -689,6 +978,156 @@ class WholeBodyIK:
         )
         if self.low_accel_task is not None:
             self.low_accel_task.Delta_q_prev = None  # None == "from rest"
+
+    def _freeze_base_dofs(self, dof_indices, frozen: bool) -> None:
+        """Zero (frozen) or restore the velocity limit of the given base tangent
+        DOFs. Mirrors into _v_tan so the Phase-0 output clamp stays consistent.
+        The freeze is coordinated inside the QP (Pink's VelocityLimit reads
+        model.velocityLimit live), so the arms/torso re-solve around the pinned
+        DOFs. No-op without base_joint_name (nothing to freeze) or when
+        enforce_limits is False (velocity limit bypassed)."""
+        if not self._base_v_index:
+            return
+        for iv in dof_indices:
+            k = self._base_v_index.index(iv)
+            cap = 0.0 if frozen else float(self._base_v_cap[k])
+            self.model.velocityLimit[iv] = cap
+            self._v_tan[iv] = cap
+
+    def set_base_xy_frozen(self, frozen: bool) -> None:
+        """Pin (or release) the base TRANSLATION (chassis x, y) only. Phase-1
+        dead-zone lever, gated on head horizontal speed. Leaves yaw untouched
+        (Phase-4b: xy and yaw freeze independently)."""
+        if not self._base_v_index or frozen == self._base_xy_frozen:
+            return
+        self._freeze_base_dofs(self._base_v_index[0:2], frozen)
+        self._base_xy_frozen = bool(frozen)
+
+    def set_base_yaw_frozen(self, frozen: bool) -> None:
+        """Pin (or release) the base YAW (chassis turn) only. Gated on the
+        combined yaw-rate signal (Phase-4b) when yaw scheduling is on, else
+        mirrors the xy freeze. Independent of xy so an in-place turn (low
+        translation, high yaw rate) can turn the base without walking."""
+        if not self._base_v_index or frozen == self._base_yaw_frozen:
+            return
+        self._freeze_base_dofs([self._base_v_index[2]], frozen)
+        self._base_yaw_frozen = bool(frozen)
+
+    def set_base_frozen(self, frozen: bool) -> None:
+        """Pin (or release) the WHOLE mobile base (x, y, yaw) at once.
+
+        Backward-compatible convenience wrapping set_base_xy_frozen +
+        set_base_yaw_frozen. Used by (re)calibration and the self-checks. When
+        yaw scheduling is off, sim_teleop drives yaw to mirror xy so this remains
+        the effective behaviour; when on, xy and yaw are gated independently.
+        """
+        self.set_base_xy_frozen(frozen)
+        self.set_base_yaw_frozen(frozen)
+
+    @property
+    def base_xy_frozen(self) -> bool:
+        """Whether the base translation (x, y) is currently pinned."""
+        return self._base_xy_frozen
+
+    @property
+    def base_yaw_frozen(self) -> bool:
+        """Whether the base yaw (turn) is currently pinned."""
+        return self._base_yaw_frozen
+
+    @property
+    def base_frozen(self) -> bool:
+        """Whether the WHOLE base is pinned (both xy and yaw). Kept for the
+        status line / self-checks; prefer base_xy_frozen / base_yaw_frozen."""
+        return self._base_xy_frozen and self._base_yaw_frozen
+
+    def set_lean_frozen(self, frozen: bool) -> None:
+        """Pin (or release) the trunk lean spine for subsequent solves.
+
+        Phase-1b dead-zone (generalizing the successful Phase-1 base dead-zone):
+        when the operator is not squatting or bending (head vertical speed below
+        threshold), the lean angles (torso_joint_1/2/3: ankle/knee/hip pitch)
+        freeze at their current values so the knees/ankles stop jittering during
+        stationary fine manipulation. When the operator squats or bends forward
+        (head vertical speed rises above threshold), the spine unfreezes to track
+        the height/posture change. Mirrors set_base_frozen but gates on head
+        VERTICAL speed (squat detection) instead of horizontal (walk detection).
+
+        Idempotent and O(1); takes effect on the next solve() because Pink's
+        VelocityLimit reads model.velocityLimit live. No-op if the solver was
+        built without trunk_lean_joint_names (nothing to freeze), or when
+        enforce_limits is False (bypass mode cannot freeze).
+        """
+        if not self._lean_v_index or frozen == self._lean_frozen:
+            return
+        cap = np.zeros(len(self._lean_v_index)) if frozen else self._lean_v_cap
+        self.model.velocityLimit[self._lean_v_index] = cap
+        # Mirror into the Phase-0 output clamp so frozen DOFs also clamp to 0.
+        for k, iv in enumerate(self._lean_v_index):
+            self._v_tan[iv] = cap[k]
+        self._lean_frozen = bool(frozen)
+
+    @property
+    def lean_frozen(self) -> bool:
+        """Whether the trunk lean spine is currently pinned (see set_lean_frozen)."""
+        return self._lean_frozen
+
+    def set_chassis_yaw_damping(self, cost: float) -> None:
+        """Dynamically set the chassis yaw damping cost (Phase-4 continuous
+        scheduling). Only effective when the base is UNFROZEN -- when frozen the
+        velocityLimit=0 dominates and this damping value is moot. The cost is
+        written live into damping_task.cost[chassis_yaw_v_index] and takes effect
+        on the next solve(). Caller is responsible for smoothing the cost itself
+        (EMA) to avoid QP objective discontinuities ("shift shock"). No-op if the
+        solver was built without base_joint_name or damping_task."""
+        if not self._base_v_index or self.damping_task is None:
+            return
+        self.damping_task.cost[self._base_v_index[2]] = float(cost)
+
+    @property
+    def chassis_yaw_damping(self) -> float:
+        """Current chassis yaw damping cost (read-only query for telemetry)."""
+        if not self._base_v_index or self.damping_task is None:
+            return 0.0
+        return float(self.damping_task.cost[self._base_v_index[2]])
+
+    def set_chassis_xy_damping(self, cost: float) -> None:
+        """Dynamically set the chassis TRANSLATION (x, y) damping cost (Phase-4b
+        continuous scheduling, mirrors set_chassis_yaw_damping). Only effective
+        when the base xy is UNFROZEN. Writes both x and y damping entries live;
+        caller smooths the cost (EMA) to avoid shift shock. No-op without
+        base_joint_name / damping_task."""
+        if not self._base_v_index or self.damping_task is None:
+            return
+        self.damping_task.cost[self._base_v_index[0]] = float(cost)
+        self.damping_task.cost[self._base_v_index[1]] = float(cost)
+
+    @property
+    def chassis_xy_damping(self) -> float:
+        """Current chassis xy (translation) damping cost (telemetry; x entry)."""
+        if not self._base_v_index or self.damping_task is None:
+            return 0.0
+        return float(self.damping_task.cost[self._base_v_index[0]])
+
+    def set_base_target(self, x: float, y: float, yaw: float) -> None:
+        """Set the chassis (x, y, yaw) reference for the Phase-2 base task.
+
+        No-op if the base-tracking task was not built (base_track_cost == 0).
+        sim_teleop calls this each tick with a target derived from the head
+        displacement/yaw; while the base is frozen it passes the current base
+        pose so the task error stays ~0.
+        """
+        if self.base_task is not None:
+            self.base_task.set_target(x, y, yaw)
+
+    def set_waist_yaw_target(self, yaw: float) -> None:
+        """Set the waist-yaw (torso_joint_4) reference for the Phase-2b task.
+
+        No-op if the waist-yaw task was not built (waist_yaw_follow_cost == 0, or
+        EgoPoser owns the waist). sim_teleop calls this each tick with the head
+        interaural yaw since calibration, clamped to a soft limit.
+        """
+        if self.waist_task is not None:
+            self.waist_task.set_target(yaw)
 
     def _to_model_q(self, q_body: np.ndarray) -> np.ndarray:
         q = pin.neutral(self.model)
@@ -775,6 +1214,26 @@ class WholeBodyIK:
 
         dt = self.control_dt
         v = self._solve_velocity(cfg, dt)
+
+        # --- Phase-0 output guard (safety net) ------------------------------ #
+        # A degenerate / near-singular QP can return a non-finite or physically
+        # impossible velocity WITHOUT raising NoSolutionFound (quadprog on an
+        # ill-conditioned Hessian). Integrating that propagates NaN/huge joint
+        # values into MuJoCo, which then reports "Nan, Inf or huge value in
+        # QACC" and the sim explodes. Two cheap checks stop it here:
+        #   1. non-finite velocity -> hold still this tick (zero velocity);
+        #   2. otherwise clamp |v| to the per-DOF velocity cap (the QP should
+        #      already respect it; this catches the limit-dropped fallback path
+        #      and any numerical overshoot).
+        if not np.isfinite(v).all():
+            # Non-finite is ALWAYS rejected (NaN protection is unconditional).
+            v = np.zeros(self.model.nv)
+        elif self.enforce_limits:
+            # Velocity clamp only when limits are enforced -- enforce_limits=False
+            # is a documented "truly unconstrained" mode (used for A/B tests), so
+            # we must not silently re-impose the cap there.
+            v = np.clip(v, -self._v_tan, self._v_tan)
+
         q_model = cfg.integrate(v, dt)
         # Remember this step's velocity so the next tick can bound / penalise the
         # change. The hard acceleration limit only matters when limits are on;
@@ -785,6 +1244,11 @@ class WholeBodyIK:
             self.low_accel_task.set_last_integration(v, dt)
 
         q = self._from_model_q(q_model)
+        # Final belt-and-suspenders: never return a non-finite configuration --
+        # hold the previous one so nothing downstream (command_arm -> MuJoCo)
+        # ever sees NaN/Inf.
+        if not np.isfinite(q).all():
+            return q_init
         if self._max_joint_step is not None:        # legacy clamp, off by default
             q = q_init + np.clip(q - q_init,
                                  -self._max_joint_step, self._max_joint_step)

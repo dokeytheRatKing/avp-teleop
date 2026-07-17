@@ -64,9 +64,19 @@ class PoseFilter:
         self,
         alpha_translation: float = 1.0,
         alpha_rotation: float = 1.0,
+        max_translation_jump: float = 0.0,
     ) -> None:
         self.alpha_translation = float(alpha_translation)
         self.alpha_rotation = float(alpha_rotation)
+        # Outlier rejection: cap the per-tick jump of the RAW translation target
+        # (metres) before it enters the EMA. AVP occasionally emits a corrupt
+        # pose, or a dropout is followed by a frame taken after the hand has
+        # moved far -- either way a single large jump, fed through the
+        # near-singular arm Jacobian, makes the robot twitch violently. Clamping
+        # the jump limits how far one frame can pull the target; a genuinely fast
+        # motion just ramps over a few ticks. ``0.0`` disables the clamp (the
+        # rotation channel is already limited by SLERP's fractional step).
+        self.max_translation_jump = float(max_translation_jump)
         self._p: Optional[np.ndarray] = None   # filtered translation (3,)
         self._R: Optional[np.ndarray] = None   # filtered rotation (3, 3)
 
@@ -95,6 +105,16 @@ class PoseFilter:
         if self._p is None:
             self._p = p.copy()
         else:
+            # Outlier rejection first: if the raw target jumped more than
+            # max_translation_jump from the last filtered output, pull it back
+            # onto a sphere of that radius (limit the jump direction/magnitude)
+            # before smoothing. This caps a single corrupt/post-dropout frame;
+            # sustained motion converges over the next ticks.
+            if self.max_translation_jump > 0.0:
+                delta = p - self._p
+                dist = float(np.linalg.norm(delta))
+                if dist > self.max_translation_jump:
+                    p = self._p + delta * (self.max_translation_jump / dist)
             a = self.alpha_translation
             self._p = a * p + (1.0 - a) * self._p
 

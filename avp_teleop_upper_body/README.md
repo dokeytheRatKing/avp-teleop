@@ -172,7 +172,7 @@ QP 只跟踪头 + 双手，躯干姿态"够用但不够拟人"。[EgoPoser](http
 - **`--visualize-prior`**：在 MuJoCo 渲染循环里，用**青色线框（capsule）+ 橙色关节球**画出 EgoPoser 幻想的 SMPL 矢状骨架（骨盆→spine1/2/3→颈→头），**竖直锚定在机器人髋部**（`astribot_torso_joint_3`；注意 `torso_joint_1/2/3` = 踝/膝/髋，髋才对应人体骨盆），并随机器人腰部偏航一起转，便于你**直观确认**先验是否合理。骨架由 `pose_body` 局部旋转经名义骨长做正运动学得到（仅用于可视化，不参与重定向数学）。隐含 `--egoposer`。
 - **简化渲染（默认开启）**：为降低渲染开销并便于观察，默认把场景**压平成灰色**（剥离贴图、关阴影、关天空盒/反射/雾）。`--visualize-prior` 时机器人本体默认**半透明**（`--body-alpha 0.35`）好让骨架透出来；用 `--body-alpha` 调透明度，用 `--rich-render` 恢复完整贴图/阴影外观。
 - torch 或权重缺失时估计器自报 unavailable，先验静默关闭，遥操作不受影响。
-- 原理详解见 [retargetting.md](retargetting.md) §3.4。
+- 原理详解见 [retargetting.md](../progress%20report/retargetting.md) §3.4。
 
 ---
 
@@ -332,6 +332,56 @@ python -m avp_teleop_upper_body.sim_teleop --init-pose my_pose
 
 ---
 
+## 录制 / 回放（不必每次都戴头套）
+
+戴一次 Vision Pro 把输入录下来，之后就能反复离线跑重定向、调参、看渲染，不用再戴头套。有**两条相互解耦**的轨迹：
+
+| 轨迹 | 目录 | 存什么 | 用途 |
+| --- | --- | --- | --- |
+| **AVP 原始输入** | `avp_trajectory/` | 每拍的头 4×4 + 双手腕 4×4 + 21×3 关键点 + pinch | 回放后**重新跑完整重定向+IK+渲染** |
+| **重定向轨迹** | `retargetting_trajectory/` | 上者的超集：CLI 参数 + 原始输入 + 目标 + 23 关节角 + 手指 + 先验 + 骨架 | **纯回放（零计算）** + 离线分析 |
+
+### 怎么开始 / 怎么结束录制（重要）
+
+- **开始录制**：**不需要按任何键**。只要命令行带了 `--record-avp` 或 `--record-retarget`，程序加载完毕后**立即自动开始录制**，逐拍捕获（包括无数据/无效拍，保真时序）。
+- **结束并保存**：**关闭 MuJoCo 窗口**，**或**在终端按 **`Ctrl+C`** —— 两者都会**停止并保存**。（再按一次 `Ctrl+C` 会强制退出、不保存。）
+- **首尾裁剪**：保存时默认**丢掉首尾各 2 秒**（`--record-trim`，设 0 保留全部），用来切掉你手忙脚乱按键启动/结束的那段。剩余帧时间戳会重新归零。
+- `space` 暂停的是**遥操作**；录制"原始 AVP 输入"在暂停时**仍继续**（录的是输入流，与机器人是否动无关）。
+
+> 提示：录制时默认会在 MuJoCo 里画出**世界坐标系** + **头/左手/右手的原始位姿**（RGB 三色轴 = XYZ，黄/紫/青 = 头/左/右），方便你实时核对输入是否正常。`--no-input-frames` 关闭，`--show-input-frames` 可在非录制时也开。
+
+### 四种工作流
+
+```bash
+# A. 戴 AVP，录原始输入（自动切首尾各 2 秒；结束用关窗口或 Ctrl+C）
+python -m avp_teleop_upper_body.sim_teleop --record-avp clip1
+
+# B. 用录好的输入跑重定向+渲染（不戴头套！首帧自动标定）
+python -m avp_teleop_upper_body.sim_teleop --replay-avp clip1
+
+# C. 录完整重定向轨迹（可戴 AVP，也可喂旧输入 clip1 再生成一条可分析轨迹）
+python -m avp_teleop_upper_body.sim_teleop --replay-avp clip1 --record-retarget run1
+
+# D. 纯回放（零计算，只重放动作 + 全部叠加层；可暂停 / 拖进度）
+python -m avp_teleop_upper_body.replay_retarget run1
+```
+
+A/B/C 可自由组合。想保留完整录制不裁剪：加 `--record-trim 0`。
+
+### 纯回放播放器按键（焦点在 MuJoCo 窗口）
+
+| 键 | 作用 |
+| --- | --- |
+| `space` | 暂停 / 继续 |
+| `.` / `,` | 暂停时逐帧前进 / 后退 |
+| `]` / `[` | 快进 / 快退 1 秒 |
+| `0` | 跳到开头 |
+| `l` | 切换循环播放 |
+
+回放是完整位姿快照逐帧重放，反向拖动零成本；终端打印文本进度条。
+
+---
+
 ## 模块结构
 
 ```
@@ -345,7 +395,11 @@ avp_teleop_upper_body/
   pose_editor.py     # 交互式姿态编辑器：键盘摆 torso/neck/双臂(底盘钉在原点)、实时渲染、保存初始姿态
   pose_io.py         # 姿态存取(JSON，按关节名)；sim_teleop --init-pose / pose_editor 共用
   poses/             # 保存的姿态(<name>.json)
-  selfcheck.py       # 离线自检(12 项)
+  trajectory_io.py   # 录制/回放：AVP 原始输入 + 完整重定向轨迹 两套 JSON schema；FileAvpSource(替换 UDP 订阅器) + 首尾裁剪 trim_frames
+  replay_retarget.py # 纯回放播放器(零计算)：读重定向轨迹，逐帧灌关节+手指+复现叠加层，可暂停/拖进度
+  avp_trajectory/    # 录下的 AVP 原始输入(<name>.json)
+  retargetting_trajectory/  # 录下的完整重定向轨迹(<name>.json)
+  selfcheck.py       # 离线自检(13 项)
   egoposer/          # EgoPoser 神经躯干先验(可选)：network/feature_builder/estimator/rotations
 ```
 

@@ -757,6 +757,11 @@ def main() -> None:
                              "this many seconds before an automatic switch is "
                              "allowed. Suppresses gear chatter at threshold "
                              "boundaries (default 2.5). 0 disables the lock.")
+    parser.add_argument("--upper-body-only", action="store_true",
+                        help="Upper-body-only mode for real robot safety: lock "
+                             "the base (chassis xy + yaw) and lower body (legs), "
+                             "allowing only waist rotation (torso_joint_4) and "
+                             "upper body movement. Overrides all gear settings.")
     args = parser.parse_args()
 
 
@@ -939,6 +944,20 @@ def main() -> None:
     )
 
     _set_body_home(model, data, body_robot, body_home)
+
+    # Upper-body-only mode: lock base and lower body for real robot safety
+    if args.upper_body_only:
+        print("[SAFETY] Upper-body-only mode enabled:")
+        print("  - Base (chassis xy + yaw) LOCKED")
+        print("  - Lower body (legs) LOCKED")
+        print("  - Waist rotation (torso_joint_4) ACTIVE")
+        print("  - Upper body (arms, neck, lean) ACTIVE")
+        # Force base into P gear (frozen) and disable all automatic switching
+        ik.set_base_xy_frozen(True)
+        ik.set_base_yaw_frozen(True)
+        ik.set_lean_frozen(True)  # Also lock lean (torso_joint_1/2/3) for safety
+        cfg.ik.base_deadzone = False  # Disable automatic gear switching
+        print("  [OK] Base and lower body locked.\n")
 
     # Input source: a recorded AVP clip (--replay-avp) or the live UDP stream.
     # FileAvpSource matches UpperBodySubscriber's poll() contract, so the loop
@@ -1429,7 +1448,8 @@ def main() -> None:
                 # otherwise yaw mirrors xy for byte-identical pre-4b behaviour.
                 # Gear-lock: only switch once the dwell period since the last
                 # switch has elapsed (suppresses freeze/unfreeze chatter).
-                if gear_lock.can_switch("base_trans"):
+                # SKIPPED when --upper-body-only mode is active (base must stay frozen).
+                if gear_lock.can_switch("base_trans") and not args.upper_body_only:
                     if ik.base_xy_frozen and base_dz["speed"] > cfg.ik.base_unfreeze_speed:
                         ik.set_base_xy_frozen(False)
                         gear_lock.register_switch("base_trans")
@@ -1465,7 +1485,8 @@ def main() -> None:
             # lean_unfreeze_speed). Orthogonal to the base's horizontal gate.
             # Head missing this tick -> hold last state.
             # SKIPPED when manual override is active for body_pitch.
-            if pitch_override is None and live["head"] is not None:
+            # SKIPPED when --upper-body-only mode is active (lean must stay frozen).
+            if pitch_override is None and live["head"] is not None and not args.upper_body_only:
                 head_z = float(np.asarray(live["head"])[2, 3])
                 if base_dz["prev_z"] is not None:
                     inst = abs(head_z - base_dz["prev_z"]) / (1.0 / 60.0)
@@ -1525,7 +1546,8 @@ def main() -> None:
                 # xy dead-zone above. So an in-place turn (low translation, high
                 # yaw rate) releases the base yaw even while xy stays frozen
                 # (fixes clip11). Only when base_deadzone is on.
-                if cfg.ik.base_deadzone and gear_lock.can_switch("base_yaw"):
+                # SKIPPED when --upper-body-only mode is active (base must stay frozen).
+                if cfg.ik.base_deadzone and gear_lock.can_switch("base_yaw") and not args.upper_body_only:
                     if ik.base_yaw_frozen and r > cfg.ik.base_yaw_unfreeze_rate:
                         ik.set_base_yaw_frozen(False)
                         gear_lock.register_switch("base_yaw")

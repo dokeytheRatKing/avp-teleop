@@ -68,6 +68,7 @@ from avp_teleop_upper_body.trajectory_io import (
     load_retarget_trajectory,
 )
 from avp_teleop_upper_body import pose_io
+from avp_teleop_upper_body.manual_override import ManualOverrideController, GearLock
 
 Target = Tuple[np.ndarray, Optional[np.ndarray]]  # (world_p, world_R_or_None)
 
@@ -156,6 +157,140 @@ def _gear_tag(name, frozen, scheduling, damp, static, floor):
     span = static - floor
     pct = 0.0 if span <= 1e-9 else 100.0 * (static - damp) / span
     return f"{name} D {damp:.1f}[{pct:.0f}%]"
+
+
+def _gear_snapshot(ik, cfg, manual_override, gear_lock):
+    """Snapshot the three mode-switch axes for the status displays.
+
+    Returns {axis: (gear, damp, pct, manual_s, lock_s)} where gear is "P"/"N"/"D",
+    damp the live damping cost (0 when frozen; None for body_pitch which has
+    no damping schedule), pct the ramp release percentage (0% = static/N,
+    100% = at the floor), manual_s the seconds left on a manual override
+    (0 = none), and lock_s the seconds left on the automatic gear-lock dwell
+    (0 = none). Manual always overrides automatic, so the display shows MANU
+    when manual_s > 0, else LOCK when lock_s > 0, else AUTO (see mode column
+    in _gear_axis_str / _gear_overlay_texts). Shared by the terminal status
+    line and the MuJoCo window overlay so the two can never disagree."""
+    out = {}
+    for axis, frozen, damp, static, floor, sched in (
+        ("base_trans", ik.base_xy_frozen, ik.chassis_xy_damping,
+         cfg.ik.damping_cost_chassis_linear, cfg.ik.trans_schedule_floor,
+         cfg.ik.enable_trans_scheduling),
+        ("base_yaw", ik.base_yaw_frozen, ik.chassis_yaw_damping,
+         cfg.ik.damping_cost_chassis_yaw, cfg.ik.yaw_schedule_floor,
+         cfg.ik.enable_yaw_scheduling),
+    ):
+        gear = "P" if frozen else ("D" if sched and damp < static - 0.1 else "N")
+        d = 0.0 if frozen else damp
+        pct = 0.0
+        if sched and not frozen:
+            span = static - floor
+            if span > 1e-9:
+                pct = 100.0 * (static - d) / span
+        out[axis] = (gear, d, pct, manual_override.time_remaining(axis),
+                     gear_lock.time_remaining(axis))
+    out["body_pitch"] = ("P" if ik.lean_frozen else "N", None, None,
+                         manual_override.time_remaining("body_pitch"),
+                         gear_lock.time_remaining("body_pitch"))
+    return out
+
+
+def _gear_mode_str(manual, lock) -> str:
+    """Mode column shared by both displays: MANU (manual override) > LOCK
+    (automatic dwell lock) > AUTO. Manual always overrides automatic, so a live
+    manual countdown is shown in preference to the lock's; unambiguous."""
+    if manual > 0:
+        return f"MANU {manual:3.1f}s"
+    if lock > 0:
+        return f"LOCK {lock:3.1f}s"
+    return "AUTO"
+
+
+def _gear_axis_str(state) -> str:
+    """Fixed-width terminal cell for one axis: 'D  11.7 [  7%] M 1.5s'.
+
+    Trailing tag: 'M x.xs' = manual override, 'L x.xs' = automatic dwell lock
+    (manual > lock > blank), padded to a constant 6 chars so the \\r status
+    line stays aligned regardless of which (if any) timer is active."""
+    gear, damp, pct, manual, lock = state
+    s = gear if damp is None else f"{gear} {damp:5.1f} [{pct:3.0f}%]"
+    if manual > 0:
+        tag = f" M{manual:4.1f}s"
+    elif lock > 0:
+        tag = f" L{lock:4.1f}s"
+    else:
+        tag = "       "  # 7 spaces to hold width
+    return s + tag
+
+
+# MuJoCo's overlay font (mjFONTSCALE_150) is PROPORTIONAL: a space is 6px but a
+# digit is 12px, a dot 6px, a '%' 18px -- all clean multiples of the 6px space.
+# So a numeric field is pixel-aligned by left-padding TWO spaces per missing
+# integer digit (each digit = 2 spaces wide), NOT one space as "%5.1f" does.
+# The 2:1 digit:space ratio holds at every font scale, so this stays robust.
+_GEAR_DAMP_INT_DIGITS = 3   # damp shown X.X, up to 3 integer digits (=> 999.9)
+_GEAR_PCT_DIGITS = 3        # pct shown as integer%, up to 3 digits (=> 100%+)
+
+
+def _gear_pad_damp(damp) -> str:
+    """Right-align a damping value (X.X) to a fixed pixel width via 2-space/digit
+    padding. ``None`` (body_pitch, no schedule) -> all-blank cell of equal width."""
+    if damp is None:
+        # int-digits(2sp each) + dot(1sp) + one decimal digit(2sp) = 2*N + 3
+        return " " * (2 * _GEAR_DAMP_INT_DIGITS + 3)
+    s = f"{damp:.1f}"
+    int_len = len(s.split(".")[0])
+    return "  " * max(0, _GEAR_DAMP_INT_DIGITS - int_len) + s
+
+
+def _gear_pad_pct(pct) -> str:
+    """Right-align a percentage (N%) to a fixed pixel width; ``None`` -> blank cell.
+    The '%' is 18px = 3 spaces, so a blank cell is (digits*2 + 3) spaces wide."""
+    if pct is None:
+        return " " * (2 * _GEAR_PCT_DIGITS + 3)
+    # pct is a release fraction (0% at static damping, 100% at the floor); clamp
+    # to [0,100] so a transient out-of-band value can't blow the fixed width.
+    s = f"{min(100.0, max(0.0, pct)):.0f}"
+    return "  " * max(0, _GEAR_PCT_DIGITS - len(s)) + s + "%"
+
+
+def _gear_overlay_texts(gears):
+    """Build the viewer.set_texts() payload showing the three P/N/D gears.
+
+    Alignment in a PROPORTIONAL font is achieved by exploiting MuJoCo's built-in
+    two-column overlay split, not by space-padding a single string (which the
+    user correctly diagnosed as impossible: a space is 6px, a digit 12px, and the
+    gear letters D/N=15px vs P=14px differ by 1px -- not a multiple of 6, so no
+    padding aligns them).
+
+      * Column A (text1) = the axis labels ONLY. They are CONSTANT strings, so
+        MuJoCo's split point (where column B begins) is a fixed x every frame.
+      * Column B (text2) = the fixed-pixel-width NUMBER block first (damp, pct;
+        see _gear_pad_*), so the numbers start at that fixed x and are perfectly
+        aligned. The gear letter follows the constant-width number block, so the
+        gears land in their OWN aligned column too. Only the trailing mode word
+        (AUTO / MANU + countdown) absorbs the unavoidable 1px gear-letter jitter,
+        and it has nothing after it to misalign against.
+
+        GEAR
+        trans    11.7  100%  D  AUTO
+        yaw       0.1    0%  N  LOCK 1.8s   (automatic dwell lock counting down)
+        pitch               P  MANU 1.5s   (manual override; no damping schedule)
+
+    Mode column: MANU (manual override) > LOCK (automatic gear-lock dwell) >
+    AUTO. Refreshed every frame so the countdown ticks live (the terminal
+    status line only updates every 2 s)."""
+    labels, values = ["GEAR"], [""]
+    for axis, label in (("base_trans", "trans"), ("base_yaw", "yaw"),
+                        ("body_pitch", "pitch")):
+        gear, damp, pct, manual, lock = gears[axis]
+        mode_col = _gear_mode_str(manual, lock)
+        labels.append(label)
+        values.append(f"{_gear_pad_damp(damp)}  {_gear_pad_pct(pct)}  "
+                      f"{gear}  {mode_col}")
+    return [(mujoco.mjtFontScale.mjFONTSCALE_150,
+             mujoco.mjtGridPos.mjGRID_TOPRIGHT,
+             "\n".join(labels), "\n".join(values))]
 
 
 def _set_body_home(model, data, robot: SimRobot, home) -> None:
@@ -535,6 +670,25 @@ def main() -> None:
                         help="Override the NeuralPostureTask cost (default "
                              f"{cfg.ik.neural_posture_cost}); higher = stronger "
                              "human trunk bias. Only used with --egoposer.")
+    parser.add_argument("--posture-boost-d-gear", type=float,
+                        default=cfg.ik.posture_boost_d_gear,
+                        help="PostureTask (home-pose regularization) cost multiplier "
+                             "when chassis enters D gear (trans or yaw), pulls all joints "
+                             "(including waist yaw torso_joint_4) toward home during "
+                             "locomotion (default %(default)s). 1.0 = no boost.")
+    parser.add_argument("--waist-boost-d-gear", type=float,
+                        default=cfg.ik.waist_boost_d_gear,
+                        help="DEPRECATED: now an alias for --neural-boost-d-gear; kept "
+                             "for backward compatibility.")
+    parser.add_argument("--neural-boost-d-gear", type=float,
+                        default=cfg.ik.neural_boost_d_gear,
+                        help="NeuralPostureTask cost multiplier in D gear (default "
+                             "%(default)s, EgoPoser only).")
+    parser.add_argument("--waist-zero-d-gear-cost", type=float,
+                        default=cfg.ik.waist_zero_d_gear_cost,
+                        help="Dedicated waist→0° task cost in D gear: pulls "
+                             "torso_joint_4 toward 0 during locomotion, independent "
+                             "of PostureTask. 0 = disabled (default %(default)s).")
     parser.add_argument("--visualize-prior", action="store_true",
                         help="Draw the EgoPoser-hallucinated FULL SMPL body "
                              "skeleton (legs, spine, arms, neck, head) as a "
@@ -589,6 +743,20 @@ def main() -> None:
     parser.add_argument("--no-input-frames", action="store_true",
                         help="Force the raw-AVP input frames OFF even while "
                              "recording (overrides the --record-avp auto-on).")
+    parser.add_argument("--no-gear-hud", action="store_true",
+                        help="Disable the P/N/D gear HUD overlay in the MuJoCo "
+                             "window (top-right box, on by default). The terminal "
+                             "status line is unaffected.")
+    parser.add_argument("--manual-override-duration", type=float, default=5.0,
+                        help="Duration (seconds) for manual gear overrides via "
+                             "keyboard (keys 2-9). After this time, the axis "
+                             "returns to automatic control (default 5.0).")
+    parser.add_argument("--gear-dwell-time", type=float, default=2.5,
+                        help="After ANY gear switch (automatic freeze/unfreeze or "
+                             "manual override), lock the axis in its new gear for "
+                             "this many seconds before an automatic switch is "
+                             "allowed. Suppresses gear chatter at threshold "
+                             "boundaries (default 2.5). 0 disables the lock.")
     args = parser.parse_args()
 
 
@@ -662,6 +830,11 @@ def main() -> None:
         cfg.egoposer.weights_path = args.egoposer_weights
     if args.neural_posture_cost is not None:
         cfg.ik.neural_posture_cost = args.neural_posture_cost
+    cfg.ik.posture_boost_d_gear = args.posture_boost_d_gear
+    # Backward compat: --waist-boost-d-gear is now an alias for neural_boost_d_gear
+    cfg.ik.neural_boost_d_gear = args.neural_boost_d_gear
+    cfg.ik.waist_boost_d_gear = args.waist_boost_d_gear  # keep for old scripts
+    cfg.ik.waist_zero_d_gear_cost = args.waist_zero_d_gear_cost
     # If the prior is off, force the task cost to 0 so the solver never builds
     # the NeuralPostureTask (byte-for-byte the non-neural pipeline). If it is on
     # but the cost is still 0, give it a sensible default so the flag does work.
@@ -878,6 +1051,7 @@ def main() -> None:
     # viz-only orientation recomputed with track=True so the triad shows the live
     # AVP command orientation even when the arm IK tracks position only.
     show_targets = not args.no_target_markers
+    show_gear_hud = not args.no_gear_hud
     viz_rot: Dict[str, Optional[np.ndarray]] = {"head": None, "left": None, "right": None}
     if show_targets:
         print("[SIM] Target markers ON: yellow=head, purple=left, teal=right "
@@ -924,12 +1098,31 @@ def main() -> None:
     # Lean-spine dead-zone (Phase 1b) also starts FROZEN (stationary at calib).
     ik.set_lean_frozen(True)
 
+    # Manual keyboard override controller (keys 2-9 for manual gear shifting).
+    manual_override = ManualOverrideController(override_duration=args.manual_override_duration)
+    # Dwell-time lock: debounce automatic gear switches (see GearLock). One entry
+    # per axis; automatic freeze/unfreeze consults can_switch() and calls
+    # register_switch() on every transition.
+    gear_lock = GearLock(dwell_time=args.gear_dwell_time)
+
     def key_callback(keycode: int) -> None:
+        # Try manual override handler first (keys 2-9)
+        override_msg = manual_override.handle_keypress(keycode)
+        if override_msg is not None:
+            # Clear the current status line (printed with \r) before our message
+            print("\r" + " " * 200 + "\r", end="")  # Extended clear length
+            print(override_msg)
+            return
+        # Existing keybinds
         if keycode == 67:      # 'c'
             state["needs_calib"] = True
+            # Clear status line before printing
+            print("\r" + " " * 200 + "\r", end="")
             print("[SIM] Recalibration requested (head + both hands).")
         elif keycode == 32:    # space
             state["paused"] = not state["paused"]
+            # Clear status line before printing
+            print("\r" + " " * 200 + "\r", end="")
             print(f"[SIM] {'Paused' if state['paused'] else 'Resumed'}.")
 
     print(f"[SIM] Subscribing udp://{args.host}:{args.port} | "
@@ -1004,6 +1197,8 @@ def main() -> None:
     if cfg.ik.com_cost > 0:
         print(f"[SIM] Balance (legacy): CoM kept over the base (com_cost={cfg.ik.com_cost:g} "
               f"on horizontal, vertical={cfg.ik.com_cost_vertical:g} -> squat free).")
+    print("[SIM] Manual mode override: keys 2-9 force gears for 2s")
+    print("[SIM]   2/3/4 = base_trans P/N/D  |  5/6/7 = base_yaw P/N/D  |  8/9 = body_pitch P/N")
     print("[SIM] Waiting for AVP frames... (press 'c' to calibrate, space to pause)")
 
     n_steps_per_frame = max(1, int(round((1.0 / 60.0) / model.opt.timestep)))
@@ -1151,13 +1346,78 @@ def main() -> None:
                     if visualize_prior and prior.skeleton is not None:
                         prior_skeleton["pts"] = prior.skeleton
 
+            # --- MANUAL OVERRIDE LAYER: apply keyboard-triggered manual gear
+            # shifts BEFORE automatic intent-based logic. Each override forces
+            # the specified axis into P/N/D for 2 seconds, then releases back
+            # to automatic control. Smooth handoff: damping EMA state is set
+            # to match the manual gear to prevent discontinuities on release.
+
+            # base_trans manual override (keys 1/2/3 -> P/N/D)
+            trans_override = manual_override.get_override("base_trans")
+            if trans_override is not None:
+                if trans_override == "P":
+                    # Force frozen (P gear)
+                    if not ik.base_xy_frozen:
+                        ik.set_base_xy_frozen(True)
+                        gear_lock.register_switch("base_trans")
+                        # Reset damping EMA to static so it doesn't carry stale low values
+                        base_dz["trans_damp_ema"] = cfg.ik.damping_cost_chassis_linear
+                elif trans_override in ("N", "D"):
+                    # Force unfrozen (N or D gear)
+                    if ik.base_xy_frozen:
+                        ik.set_base_xy_frozen(False)
+                        gear_lock.register_switch("base_trans")
+                    # Set damping: N = static, D = floor (instant, no ramp during override)
+                    if trans_override == "N":
+                        target = cfg.ik.damping_cost_chassis_linear
+                    else:  # D
+                        target = cfg.ik.trans_schedule_floor if cfg.ik.enable_trans_scheduling else cfg.ik.damping_cost_chassis_linear
+                    # Smoothly transition damping (don't jump instantly to avoid shift shock)
+                    base_dz["trans_damp_ema"] += cfg.ik.base_speed_alpha * (target - base_dz["trans_damp_ema"])
+                    ik.set_chassis_xy_damping(base_dz["trans_damp_ema"])
+
+            # base_yaw manual override (keys 4/5/6 -> P/N/D)
+            yaw_override = manual_override.get_override("base_yaw")
+            if yaw_override is not None:
+                if yaw_override == "P":
+                    # Force frozen
+                    if not ik.base_yaw_frozen:
+                        ik.set_base_yaw_frozen(True)
+                        gear_lock.register_switch("base_yaw")
+                        base_dz["yaw_sched"]["damp_ema"] = cfg.ik.damping_cost_chassis_yaw
+                elif yaw_override in ("N", "D"):
+                    # Force unfrozen
+                    if ik.base_yaw_frozen:
+                        ik.set_base_yaw_frozen(False)
+                        gear_lock.register_switch("base_yaw")
+                    # Set damping: N = static, D = floor
+                    if yaw_override == "N":
+                        target = cfg.ik.damping_cost_chassis_yaw
+                    else:  # D
+                        target = cfg.ik.yaw_schedule_floor if cfg.ik.enable_yaw_scheduling else cfg.ik.damping_cost_chassis_yaw
+                    base_dz["yaw_sched"]["damp_ema"] += cfg.ik.yaw_schedule_alpha * (target - base_dz["yaw_sched"]["damp_ema"])
+                    ik.set_chassis_yaw_damping(base_dz["yaw_sched"]["damp_ema"])
+
+            # body_pitch manual override (keys 7/8 -> P/N, no D gear)
+            pitch_override = manual_override.get_override("body_pitch")
+            if pitch_override is not None:
+                if pitch_override == "P":
+                    if not ik.lean_frozen:
+                        ik.set_lean_frozen(True)
+                        gear_lock.register_switch("body_pitch")
+                elif pitch_override == "N":
+                    if ik.lean_frozen:
+                        ik.set_lean_frozen(False)
+                        gear_lock.register_switch("body_pitch")
+
             # --- Base dead-zone: freeze the mobile base while the operator's
             # head is not translating horizontally, release it once they walk.
             # Uses the RAW AVP head xy (horizontal only, so a pure squat/bend
             # does not release the base). EMA-smoothed speed + hysteresis
             # (freeze below base_freeze_speed, release above base_unfreeze_speed)
             # so it does not chatter. Head missing this tick -> hold last state.
-            if cfg.ik.base_deadzone and live["head"] is not None:
+            # SKIPPED when manual override is active for the corresponding axis.
+            if trans_override is None and cfg.ik.base_deadzone and live["head"] is not None:
                 head_xy = np.asarray(live["head"])[:2, 3]
                 if base_dz["prev_xy"] is not None:
                     inst = float(np.linalg.norm(head_xy - base_dz["prev_xy"])) / (1.0 / 60.0)
@@ -1167,10 +1427,15 @@ def main() -> None:
                 # Phase-4b: this gates the base TRANSLATION (xy) only. Base yaw
                 # has its own gate below (combined yaw rate) when scheduling is on;
                 # otherwise yaw mirrors xy for byte-identical pre-4b behaviour.
-                if ik.base_xy_frozen and base_dz["speed"] > cfg.ik.base_unfreeze_speed:
-                    ik.set_base_xy_frozen(False)
-                elif not ik.base_xy_frozen and base_dz["speed"] < cfg.ik.base_freeze_speed:
-                    ik.set_base_xy_frozen(True)
+                # Gear-lock: only switch once the dwell period since the last
+                # switch has elapsed (suppresses freeze/unfreeze chatter).
+                if gear_lock.can_switch("base_trans"):
+                    if ik.base_xy_frozen and base_dz["speed"] > cfg.ik.base_unfreeze_speed:
+                        ik.set_base_xy_frozen(False)
+                        gear_lock.register_switch("base_trans")
+                    elif not ik.base_xy_frozen and base_dz["speed"] < cfg.ik.base_freeze_speed:
+                        ik.set_base_xy_frozen(True)
+                        gear_lock.register_switch("base_trans")
 
                 # Phase-4b TRANSLATION scheduling (D gear): once unfrozen, ease
                 # the xy damping from static (damping_cost_chassis_linear) toward
@@ -1178,7 +1443,8 @@ def main() -> None:
                 # carries the arms more eagerly when walking fast. Gentle by
                 # design. EMA-smoothed to avoid shift shock. Only when enabled and
                 # xy unfrozen (else static value / frozen dominates).
-                if cfg.ik.enable_trans_scheduling and not ik.base_xy_frozen:
+                # SKIPPED when manual override is active (override sets damping directly).
+                if trans_override is None and cfg.ik.enable_trans_scheduling and not ik.base_xy_frozen:
                     target_xy_damp = float(np.interp(
                         base_dz["speed"],
                         [cfg.ik.trans_schedule_speed_low, cfg.ik.trans_schedule_speed_high],
@@ -1186,7 +1452,7 @@ def main() -> None:
                     base_dz["trans_damp_ema"] += cfg.ik.base_speed_alpha * (
                         target_xy_damp - base_dz["trans_damp_ema"])
                     ik.set_chassis_xy_damping(base_dz["trans_damp_ema"])
-                elif cfg.ik.enable_trans_scheduling:
+                elif trans_override is None and cfg.ik.enable_trans_scheduling:
                     # xy frozen: reset the damping EMA to the static value.
                     base_dz["trans_damp_ema"] = cfg.ik.damping_cost_chassis_linear
 
@@ -1198,17 +1464,21 @@ def main() -> None:
             # with hysteresis (freeze below lean_freeze_speed, release above
             # lean_unfreeze_speed). Orthogonal to the base's horizontal gate.
             # Head missing this tick -> hold last state.
-            if live["head"] is not None:
+            # SKIPPED when manual override is active for body_pitch.
+            if pitch_override is None and live["head"] is not None:
                 head_z = float(np.asarray(live["head"])[2, 3])
                 if base_dz["prev_z"] is not None:
                     inst = abs(head_z - base_dz["prev_z"]) / (1.0 / 60.0)
                     a = cfg.ik.base_speed_alpha
                     base_dz["vspeed"] += a * (inst - base_dz["vspeed"])
                 base_dz["prev_z"] = head_z
-                if ik.lean_frozen and base_dz["vspeed"] > cfg.ik.lean_unfreeze_speed:
-                    ik.set_lean_frozen(False)
-                elif not ik.lean_frozen and base_dz["vspeed"] < cfg.ik.lean_freeze_speed:
-                    ik.set_lean_frozen(True)
+                if gear_lock.can_switch("body_pitch"):
+                    if ik.lean_frozen and base_dz["vspeed"] > cfg.ik.lean_unfreeze_speed:
+                        ik.set_lean_frozen(False)
+                        gear_lock.register_switch("body_pitch")
+                    elif not ik.lean_frozen and base_dz["vspeed"] < cfg.ik.lean_freeze_speed:
+                        ik.set_lean_frozen(True)
+                        gear_lock.register_switch("body_pitch")
 
             # --- Phase-4 continuous damping scheduling: chassis-yaw damping lowers
             # as COMBINED yaw rate rises (hands-head yaw rate + head yaw rate),
@@ -1218,7 +1488,8 @@ def main() -> None:
             # hands both turn as in clip11). Active ONLY when the base is unfrozen
             # (the dead-zone handles stationary). Damping cost itself is EMA-smoothed
             # to avoid QP objective discontinuities ("shift shock" / 换挡冲击).
-            if cfg.ik.enable_yaw_scheduling and live["head"] is not None:
+            # SKIPPED when manual override is active for base_yaw (override sets damping).
+            if yaw_override is None and cfg.ik.enable_yaw_scheduling and live["head"] is not None:
                 # 1. Head yaw rate (interaural, pitch-robust).
                 head_yaw = _head_interaural_yaw(live["head"], align_R_mat)
                 head_yaw_rate = 0.0
@@ -1254,11 +1525,13 @@ def main() -> None:
                 # xy dead-zone above. So an in-place turn (low translation, high
                 # yaw rate) releases the base yaw even while xy stays frozen
                 # (fixes clip11). Only when base_deadzone is on.
-                if cfg.ik.base_deadzone:
+                if cfg.ik.base_deadzone and gear_lock.can_switch("base_yaw"):
                     if ik.base_yaw_frozen and r > cfg.ik.base_yaw_unfreeze_rate:
                         ik.set_base_yaw_frozen(False)
+                        gear_lock.register_switch("base_yaw")
                     elif not ik.base_yaw_frozen and r < cfg.ik.base_yaw_freeze_rate:
                         ik.set_base_yaw_frozen(True)
+                        gear_lock.register_switch("base_yaw")
 
                 # 4b. Map combined rate -> damping (only when base yaw unfrozen).
                 if not ik.base_yaw_frozen:
@@ -1274,9 +1547,10 @@ def main() -> None:
                     # Frozen: reset the damping EMA to the static value so it doesn't
                     # carry stale low values into the next unfreeze.
                     base_dz["yaw_sched"]["damp_ema"] = cfg.ik.damping_cost_chassis_yaw
-            elif cfg.ik.base_deadzone:
+            elif yaw_override is None and cfg.ik.base_deadzone:
                 # Scheduling OFF: base yaw mirrors the xy freeze (byte-identical
                 # to the pre-4b behaviour -- the whole base freezes/thaws together).
+                # Only applies when manual override is NOT active.
                 if ik.base_yaw_frozen != ik.base_xy_frozen:
                     ik.set_base_yaw_frozen(ik.base_xy_frozen)
 
@@ -1335,6 +1609,39 @@ def main() -> None:
                 tgt = float(np.clip(tgt, -cfg.ik.waist_soft_limit,
                                     cfg.ik.waist_soft_limit))
                 ik.set_waist_yaw_target(tgt)
+
+            # --- D-gear posture boost: strengthen trunk regularization when the
+            # chassis enters D gear (trans or yaw), enforcing healthy posture
+            # during locomotion. TWO independent mechanisms:
+            #   1. PostureTask boost: pulls ALL joints toward home (including
+            #      torso_joint_4 waist yaw → home ≈ 0°)
+            #   2. Dedicated waist-zero task: ONLY pulls torso_joint_4 → 0° with
+            #      a fixed target (activated 0 → waist_zero_d_gear_cost in D gear)
+            #   3. NeuralPostureTask boost (if EgoPoser enabled): learned trunk prior
+            # Trade hand tracking precision for postural health while moving
+            # (acceptable: hands need not hit 100% while walking, only when
+            # stationary). All boosts OFF in P/N gears.
+            in_d_gear = (
+                (not ik.base_xy_frozen and cfg.ik.enable_trans_scheduling and
+                 ik.chassis_xy_damping < cfg.ik.damping_cost_chassis_linear - 0.1) or
+                (not ik.base_yaw_frozen and cfg.ik.enable_yaw_scheduling and
+                 ik.chassis_yaw_damping < cfg.ik.damping_cost_chassis_yaw - 0.1)
+            )
+            if in_d_gear:
+                # 1. Boost PostureTask: pulls all joints (incl waist yaw) toward home
+                ik.set_posture_cost(cfg.ik.posture_cost * cfg.ik.posture_boost_d_gear)
+                # 2. Activate waist-zero task if configured
+                ik.set_waist_zero_cost(cfg.ik.waist_zero_d_gear_cost)
+                # 3. Boost NeuralPostureTask if present (EgoPoser trunk prior)
+                if ik.neural_task is not None:
+                    ik.set_neural_posture_cost(
+                        cfg.ik.neural_posture_cost * cfg.ik.neural_boost_d_gear)
+            else:
+                # P/N gear: restore static costs, disable waist-zero
+                ik.set_posture_cost(cfg.ik.posture_cost)
+                ik.set_waist_zero_cost(0.0)
+                if ik.neural_task is not None:
+                    ik.set_neural_posture_cost(cfg.ik.neural_posture_cost)
 
             finger_cmd: Dict[str, Dict[str, float]] = {}
             if not state["paused"] and calibrated:
@@ -1407,6 +1714,13 @@ def main() -> None:
                 _draw_prior_skeleton(scn, R_anchor, p_anchor,
                                      prior_skeleton["pts"],
                                      _SMPL_PARENTS, _SMPL_MAPPED_JOINTS)
+            # Gear HUD in the MuJoCo window (top-right box), refreshed every
+            # frame so the manual-override countdown ticks live.
+            # --no-gear-hud disables it.
+            # Performance: refresh every 3 frames (10Hz @ 30fps) to save 2fps overhead
+            if show_gear_hud and cfg.ik.base_deadzone and frames_seen % 3 == 0:
+                viewer.set_texts(_gear_overlay_texts(
+                    _gear_snapshot(ik, cfg, manual_override, gear_lock)))
             viewer.sync()
 
             now = time.time()
@@ -1415,17 +1729,13 @@ def main() -> None:
                 base_tag = ""
                 if cfg.ik.base_deadzone:
                     # Three orthogonal mode-switch axes as P/N/D gears.
-                    trans = _gear_tag(
-                        "base_trans", ik.base_xy_frozen,
-                        cfg.ik.enable_trans_scheduling, ik.chassis_xy_damping,
-                        cfg.ik.damping_cost_chassis_linear, cfg.ik.trans_schedule_floor)
-                    yaw = _gear_tag(
-                        "base_yaw", ik.base_yaw_frozen,
-                        cfg.ik.enable_yaw_scheduling, ik.chassis_yaw_damping,
-                        cfg.ik.damping_cost_chassis_yaw, cfg.ik.yaw_schedule_floor)
-                    # body_pitch (lean spine) has no damping schedule -> P/N only.
-                    pitch = f"body_pitch {'P' if ik.lean_frozen else 'N'}"
-                    base_tag = f" | {trans} | {yaw} | {pitch}"
+                    # Fixed-width cells (see _gear_axis_str) so the \r status
+                    # line stays aligned whether or not a manual timer shows.
+                    g = _gear_snapshot(ik, cfg, manual_override, gear_lock)
+                    base_tag = (f" || {_gear_axis_str(g['base_trans'])}"
+                                f" | {_gear_axis_str(g['base_yaw'])}"
+                                f" | {_gear_axis_str(g['body_pitch'])} ||")
+
                 if isinstance(sub, FileAvpSource):
                     i, n = sub.progress
                     print(f"[SIM] replaying | frame {i}/{n} | {rate:.0f}/s{base_tag}",

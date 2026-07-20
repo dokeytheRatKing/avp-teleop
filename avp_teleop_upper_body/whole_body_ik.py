@@ -543,6 +543,7 @@ class WholeBodyIK:
         base_joint_name: Optional[str] = None,
         base_track_cost: float = 0.0,
         waist_yaw_follow_cost: float = 0.0,
+        waist_zero_d_gear_cost: float = 0.0,
         waist_joint_name: Optional[str] = None,
         hand_front_cost: float = 0.0,
         hand_front_margin: float = -0.15,
@@ -895,6 +896,26 @@ class WholeBodyIK:
                 int(self.model.idx_vs[wjid]), int(self.model.idx_qs[wjid]),
                 cost=waist_yaw_follow_cost)
 
+        # D-gear waist-zero task: pull torso_joint_4 toward 0° when the chassis
+        # enters D gear (trans or yaw), enforcing trunk/chassis alignment during
+        # locomotion. Built as a separate task (independent of waist_task and
+        # NeuralPostureTask) so its cost can be toggled 0 <-> waist_zero_d_gear_cost
+        # at runtime without affecting other waist constraints. Target is FIXED at
+        # 0.0 rad (set once at construction). Cost 0 disables (task not built).
+        self.waist_zero_task = None
+        if waist_zero_d_gear_cost > 0:
+            if not waist_joint_name:
+                raise ValueError(
+                    "waist_zero_d_gear_cost > 0 requires waist_joint_name "
+                    "(the waist-yaw joint, e.g. torso_joint_4).")
+            if not self.model.existJointName(waist_joint_name):
+                raise ValueError(f"Waist joint '{waist_joint_name}' not in model.")
+            wjid = self.model.getJointId(waist_joint_name)
+            self.waist_zero_task = WaistYawTask(
+                int(self.model.idx_vs[wjid]), int(self.model.idx_qs[wjid]),
+                cost=0.0)  # starts at 0, sim_teleop will boost in D gear
+            self.waist_zero_task.set_target(0.0)  # fixed target
+
         # Phase-3 hand-in-front soft guard: one-sided penalty nudging a hand
         # forward once it goes behind a pelvis-anchored margin plane (see
         # HandFrontTask). Uses the two tool frames + the hip (pelvis) frame + the
@@ -922,7 +943,7 @@ class WholeBodyIK:
                        self.posture_task]
         for task in (self.com_task, self.chest_task, self.trunk_task,
                      self.neural_task, self.base_task, self.waist_task,
-                     self.hand_front_task,
+                     self.waist_zero_task, self.hand_front_task,
                      self.damping_task, self.low_accel_task):
             if task is not None:
                 self._tasks.append(task)
@@ -1128,6 +1149,45 @@ class WholeBodyIK:
         """
         if self.waist_task is not None:
             self.waist_task.set_target(yaw)
+
+    def set_waist_yaw_cost(self, cost: float) -> None:
+        """Adjust the waist-yaw task weight at runtime (no-op if task absent).
+
+        Used by sim_teleop to strengthen waist regularization when the base enters
+        D gear (trans or yaw), enforcing trunk/chassis alignment during locomotion.
+        """
+        if self.waist_task is not None:
+            self.waist_task.cost = float(cost)
+
+    def set_neural_posture_cost(self, cost: float) -> None:
+        """Adjust the EgoPoser neural-posture task weight at runtime (no-op if absent).
+
+        Used by sim_teleop to strengthen trunk regularization when the base enters
+        D gear, reinforcing healthy posture during locomotion (waist yaw included in
+        the neural prior, so waist/chassis alignment is tightened together with pitch).
+        """
+        if self.neural_task is not None:
+            self.neural_task.cost = float(cost)
+
+    def set_posture_cost(self, cost: float) -> None:
+        """Adjust the PostureTask weight at runtime (always present).
+
+        The PostureTask pulls all joints toward the home pose. Use this to
+        strengthen whole-body regularization in D gear, ensuring healthy posture
+        during locomotion — notably torso_joint_4 (waist yaw) is pulled toward
+        home (≈0°), keeping the trunk aligned with the chassis heading while moving.
+        """
+        self.posture_task.cost = float(cost)
+
+    def set_waist_zero_cost(self, cost: float) -> None:
+        """Adjust the D-gear waist-zero task weight at runtime (no-op if absent).
+
+        The waist_zero_task (if built via waist_zero_d_gear_cost > 0) pulls
+        torso_joint_4 toward 0° with a fixed target. Set cost > 0 in D gear to
+        enforce trunk/chassis alignment during locomotion, 0 in P/N to disable.
+        """
+        if self.waist_zero_task is not None:
+            self.waist_zero_task.cost = float(cost)
 
     def _to_model_q(self, q_body: np.ndarray) -> np.ndarray:
         q = pin.neutral(self.model)

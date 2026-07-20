@@ -663,6 +663,14 @@ class WholeBodyIKConfig:
     # hip via NEURAL_PITCH_JOINT) + neural_waist_joint_name at build time and a
     # per-tick WholeBodyIK.set_neural_target(pitch, yaw).
     neural_posture_cost: float = 0.0     # cost on (trunk pitch, waist yaw) prior error
+    # Boosted posture costs when the chassis enters D gear (trans or yaw), to
+    # enforce trunk/chassis alignment during locomotion. Trade tracking precision
+    # for healthy posture while moving (acceptable: hands need not hit 100% while
+    # walking, only when stationary). 0 = no boost (static costs stay). Multipliers:
+    posture_boost_d_gear: float = 2.5    # PostureTask (home-pose) *= this in D gear
+    neural_boost_d_gear: float = 2.5     # neural_posture_cost *= this in D gear (deprecated waist_boost name kept for compat)
+    waist_boost_d_gear: float = 2.5      # DEPRECATED alias for neural_boost_d_gear
+    waist_zero_d_gear_cost: float = 0.0  # NEW: dedicated waist→0° task, 0→this in D gear (independent of posture_boost)
 
     # --- Balance: keep the CoM over the wheel base (soft constraint) -------- #
     # A ComTask pins the whole-robot centre of mass to a target in the world

@@ -45,6 +45,11 @@ avp_teleop_upper_body/retargetting_trajectory/
 # 官方 ROS2 遥操栈(第三方,体积大,单独获取)
 teleop_official/
 
+# 本地临时验证/调试脚本(不入库)
+test_manual_override.py
+test_d_gear_posture_boost.py
+debug_gear_tuning.sh
+
 # EgoPoser 预训练权重(从官方 Google Drive 下载,体积大~200MB,不入库)
 # 用 EgoPoserEstimator.download_weights() 下载到这里; config 会自动发现 egoposer.pth
 avp_teleop_upper_body/egoposer/model_zoo/

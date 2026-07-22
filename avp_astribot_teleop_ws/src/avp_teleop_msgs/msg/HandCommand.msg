@@ -1,0 +1,11 @@
+std_msgs/Header header
+string side
+string source
+string[] joint_names
+float64[] position
+float64[] velocity
+float64[] effort
+string mode
+float32 quality
+bool hold_last
+builtin_interfaces/Duration timeout

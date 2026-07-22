@@ -1,0 +1,10 @@
+std_msgs/Header header
+string base_translation_gear
+string base_yaw_gear
+string body_pitch_gear
+bool base_translation_overridden
+bool base_yaw_overridden
+bool body_pitch_overridden
+builtin_interfaces/Time base_translation_expires_at
+builtin_interfaces/Time base_yaw_expires_at
+builtin_interfaces/Time body_pitch_expires_at

@@ -1,0 +1,12 @@
+manual_override:
+  reliability: reliable
+  durability: transient_local
+  depth: 1
+robot_command:
+  reliability: best_effort
+  durability: volatile
+  depth: 1
+sensor_data:
+  reliability: best_effort
+  durability: volatile
+  depth: 5

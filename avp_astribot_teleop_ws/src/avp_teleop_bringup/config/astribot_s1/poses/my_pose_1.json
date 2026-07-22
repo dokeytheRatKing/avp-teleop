@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "robot": "astribot_s1",
+  "joint_names": [],
+  "position": [],
+  "notes": "TODO: save from measured state"
+}

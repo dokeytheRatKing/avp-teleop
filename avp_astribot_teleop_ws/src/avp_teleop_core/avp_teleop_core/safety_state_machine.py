@@ -1,0 +1,3 @@
+# DISARMED -> HOLD_CURRENT -> ALIGNING -> LIVE_TELEOP
+#                       \-> REPLAY_ALIGN -> REPLAY
+# 任意状态 -> ESTOP_LATCHED

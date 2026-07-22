@@ -1,0 +1,9 @@
+std_msgs/Header header
+bool avp_fresh
+bool robot_state_fresh
+bool ik_healthy
+bool command_bridge_healthy
+bool recorder_healthy
+float32 ik_cycle_ms
+float32 command_age_ms
+string[] warnings

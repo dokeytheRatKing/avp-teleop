@@ -1,0 +1,15 @@
+tasks:
+  head_frame: true
+  left_tool_frame: true
+  right_tool_frame: true
+  posture: true
+  chest_over_ankle: true
+  trunk_upright: true
+  low_acceleration: true
+  per_dof_damping: true
+  support_region_barrier: true
+removed:
+  neural_posture_task: true
+  ego_poser: true
+  base_tracking_task: true
+  base_follow: true

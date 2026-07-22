@@ -1,0 +1,10 @@
+string pose_name
+float64 velocity_scale
+float64 acceleration_scale
+bool hold_after
+---
+bool success
+string message
+---
+float32 progress
+float64 max_position_error

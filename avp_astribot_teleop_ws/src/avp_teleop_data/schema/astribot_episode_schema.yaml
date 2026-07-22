@@ -1,0 +1,8 @@
+version: 1
+canonical_clock: nanoseconds
+groups:
+  - metadata
+  - images_dict
+  - joints_dict
+  - command_poses_dict
+  - timestamps

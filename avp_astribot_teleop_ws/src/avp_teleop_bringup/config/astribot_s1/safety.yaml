@@ -1,0 +1,5 @@
+upper_body_only_default: true
+state_timeout_ms: 50
+command_timeout_ms: 50
+first_frame_alignment_required: true
+soft_estop_policy: hold_measured_current

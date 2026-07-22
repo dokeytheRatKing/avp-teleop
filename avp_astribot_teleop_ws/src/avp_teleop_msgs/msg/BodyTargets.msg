@@ -1,0 +1,9 @@
+std_msgs/Header header
+geometry_msgs/PoseStamped head_target
+geometry_msgs/PoseStamped left_wrist_target
+geometry_msgs/PoseStamped right_wrist_target
+bool has_head
+bool has_left_wrist
+bool has_right_wrist
+float32 left_quality
+float32 right_quality

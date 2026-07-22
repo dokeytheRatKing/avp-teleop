@@ -1,0 +1,15 @@
+manual_override_duration_s: 5.0
+keys:
+  "2": {axis: base_translation, gear: P}
+  "3": {axis: base_translation, gear: N}
+  "4": {axis: base_translation, gear: D}
+  "5": {axis: base_yaw, gear: P}
+  "6": {axis: base_yaw, gear: N}
+  "7": {axis: base_yaw, gear: D}
+  "8": {axis: body_pitch, gear: P}
+  "9": {axis: body_pitch, gear: D}
+  "g": {command: goto_named_pose, argument: my_pose_1}
+  "G": {command: save_current_pose, argument: my_pose_1}
+  "v": {command: toggle_view}
+  "space": {command: pause}
+  "esc": {command: soft_estop}

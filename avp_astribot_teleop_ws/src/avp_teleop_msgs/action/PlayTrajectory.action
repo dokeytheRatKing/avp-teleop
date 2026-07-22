@@ -1,0 +1,11 @@
+string trajectory_path
+bool align_first
+float64 replay_speed
+bool hold_after
+---
+bool success
+string message
+---
+string phase
+float32 progress
+float64 max_position_error
